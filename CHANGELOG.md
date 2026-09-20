@@ -6,6 +6,77 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-16
+
+### Added
+
+- **`cargo install bastyn`, `brew install bastyn-labs/tap/bastyn`, and a `curl | sh` installer**,
+  alongside the existing GitHub Action and GitHub Release binaries. The crates.io package (formerly
+  `bastyn-cli`) is renamed to `bastyn` to match; `bastyn-cli` itself is republished as a tiny
+  pointer crate so the old name can't be squatted. crates.io publishing uses Trusted Publishing
+  (no long-lived token in CI); the Homebrew tap update runs in a separate job from the one that
+  executes the downloaded binary, so a GitHub App signing key is never in scope alongside it;
+  `install.sh` verifies a checksum before extracting anything and is structured so a truncated
+  download can't execute a partial script. See `CONTRIBUTING.md`'s "Releasing" section for what a
+  release now touches.
+
+## [0.1.4] - 2026-09-03
+
+### Fixed
+
+- **The Action stopped publishing to the GitHub Marketplace.** `action.yml`'s `description` had
+  grown to 188 characters, past an undocumented 125-character limit GitHub enforces before it will
+  publish an action's Marketplace listing. Publishing failed silently on every release since: the
+  Marketplace page showed no error, it just stopped picking up the new name, description, and
+  version, and kept showing whatever the last release under the limit had left there. Shortened the
+  description to fit, and added a CI check (`action-metadata` in `ci.yml`, mirrored in
+  `release.yml`) so a description that grows past 125 characters again fails the build instead of
+  failing silently on the Marketplace.
+
+## [0.1.3] - 2026-09-03
+
+### Added
+
+- **`exclude` input on the GitHub Action.** The `bastyn` CLI already had a repeatable
+  `--exclude <GLOB>` flag; the Action had no way to reach it. One gitignore-style glob per line,
+  each becoming its own `--exclude` on both the log-format scan and the SARIF one, so a caller can
+  suppress specific paths without patching `.bastynignore` into the checked-out tree. Excluded
+  paths still show up under the scan's "Coverage gaps" section.
+
+## [0.1.2] - 2026-09-03
+
+Precision fixes. Four false positives found by scanning real third-party repositories, and the three
+rules that produced them. No change to what the scanner detects as a genuine defect.
+
+### Fixed
+
+- **A `Bearer` token that was template syntax, not a secret.** `BAS-LLM02-004` and `BAS-LLM02-005`
+  reported `"Bearer {{env.DAST_AUTH_TOKEN}}"` and `"Bearer ${VAR}"` as hardcoded credentials. Each is a
+  plain string literal whose contents the application substitutes at execution time. `credential.rs`
+  already read a leading `{{` or `$` as a placeholder for other rules; these two never got the guard.
+- **A credential flagged after it had been scrubbed.** `BAS-ZT1-010` and `BAS-ZT1-011` reported
+  `private_repo["accessToken"] = "[REDACTED]"`, which is a redaction routine doing its job rather than a
+  leaked secret. `redacted`, `scrubbed` and `masked` were missing from the placeholder word list that
+  `credential.rs` and the YAML rules both read from.
+- **A fully static SQL query with a model-shaped column name.** `BAS-LLM10-003` reported a literal
+  audit query because its column list contains `completion_tokens`. The rule excluded plain-literal
+  arguments by enumerating up to five adjacent concatenated literals, and this query had six across
+  mixed quote styles. The enumeration is now an end-to-end regex, so the exclusion holds for any
+  number of segments rather than the number a corpus run happened to produce.
+
+All four are now `[[expect_none]]` entries in `tests/corpus/clean/near_misses.py` and
+`near_misses.ts`, so the corpus gate fails if any of them comes back. The two remaining known false
+positives are unchanged and still ratcheted at two.
+
+### Changed
+
+- The README and the Action's Marketplace listing now present the project as BASTYN Community, and
+  describe what it checks. No behaviour change.
+- `CONTRIBUTING.md` documents how a release is cut: the tag trigger, the version numbers that must
+  agree before a tag will build, and what each release job does.
+- The JSON example in the README reports `bastyn_version` as `0.1.2`, matching the binary this
+  release publishes. It had drifted to `0.1.0` again, the same mismatch 0.1.1 corrected.
+
 ## [0.1.1] - 2026-08-31
 
 Action and documentation fixes. The scanner binary is unchanged from 0.1.0.
@@ -265,6 +336,10 @@ single point in time. This paragraph prints no number, because it drifts every t
 added. See [Measured coverage](README.md#measured-coverage) for the current count, always derived
 from the gate rather than typed in here.
 
-[Unreleased]: https://github.com/BASTYN-labs/bastyn-scan/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/BASTYN-labs/bastyn-scan/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.5
+[0.1.4]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.4
+[0.1.3]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.3
+[0.1.2]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.2
 [0.1.1]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.1
 [0.1.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.0
