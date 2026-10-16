@@ -30,6 +30,7 @@ mod error;
 pub(crate) mod flow;
 mod generated;
 mod provider_token;
+mod skill_install;
 mod test_path;
 mod walk;
 
