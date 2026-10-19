@@ -17,7 +17,7 @@ jobs:
           - macos-15-intel     # macOS X64  -- the other case it got wrong
           - windows-latest     # Windows X64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Report what runner this is
         shell: bash
         run: echo "RUNNER_OS=$RUNNER_OS RUNNER_ARCH=$RUNNER_ARCH"
