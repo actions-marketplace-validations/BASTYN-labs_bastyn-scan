@@ -425,6 +425,54 @@ fn embedded_ruleset_loads_and_is_non_empty() {
     assert!(!ruleset.is_empty());
 }
 
+#[test]
+fn embedded_ruleset_includes_the_mcp_transport_rules() {
+    let ruleset = RuleSet::embedded().unwrap();
+
+    let py = "from mcp.server.fastmcp import FastMCP\n\nmcp = FastMCP(\"n\", host=\"0.0.0.0\")\nmcp.run(transport=\"streamable-http\")\n";
+    let findings = scan_source(&ruleset, Path::new("server.py"), py);
+    assert!(
+        findings.iter().any(|f| f.rule_id == "BAS-ZT3-001"),
+        "findings: {findings:?}"
+    );
+
+    for call in [
+        "FastMCP(\"n\", host=\"0.0.0.0\", port=1)",
+        "FastMCP(host=\"0.0.0.0\", port=1)",
+        "FastMCP(\"n\", port=1, host='0.0.0.0')",
+        "FastMCP(host=\"0.0.0.0\")",
+        "uvicorn.run(app, host=\"0.0.0.0\", port=1)",
+    ] {
+        let src = format!("{call}\nrun(transport=\"sse\")\n");
+        let findings = scan_source(&ruleset, Path::new("server.py"), &src);
+        assert!(
+            findings.iter().any(|f| f.rule_id == "BAS-ZT3-001"),
+            "{call}: {findings:?}"
+        );
+    }
+    let loopback = "FastMCP(\"n\", host=\"127.0.0.1\")\nrun(transport=\"sse\")\n";
+    let findings = scan_source(&ruleset, Path::new("server.py"), loopback);
+    assert!(
+        findings.iter().all(|f| f.rule_id != "BAS-ZT3-001"),
+        "findings: {findings:?}"
+    );
+
+    let ts = "const t = new StreamableHTTPServerTransport({});\napp.listen(3000, \"0.0.0.0\");\n";
+    let findings = scan_source(&ruleset, Path::new("server.ts"), ts);
+    assert!(
+        findings.iter().any(|f| f.rule_id == "BAS-ZT3-002"),
+        "findings: {findings:?}"
+    );
+
+    // Without an HTTP transport marker in the file neither rule fires.
+    let plain = "app.listen(3000, \"0.0.0.0\");\n";
+    let findings = scan_source(&ruleset, Path::new("plain.ts"), plain);
+    assert!(
+        findings.iter().all(|f| f.rule_id != "BAS-ZT3-002"),
+        "findings: {findings:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // JS/TS twins closing the LLM08/LLM06/ZT2 recall gap: these run against the
 // real, embedded `bastyn.yml` rather than an ad-hoc rule string, so a typo in
@@ -1054,5 +1102,308 @@ rules:
     assert!(
         matches!(error, RuleError::InvalidNotRegex { .. }),
         "got {error:?}"
+    );
+}
+
+/// A rule pairing a source-shaped `any` capture with a `none_in_file` pattern
+/// for the message role it is sent under: `none` only sees the matched node
+/// and `inside` only its ancestors, so neither can see the sibling statement
+/// that sends the same value in the user role.
+const USER_ROLE_RULE_PY: &str = r#"
+rules:
+  - id: BAS-NIF-001
+    title: t
+    kind: observation
+    severity: high
+    confidence: high
+    categories: [LLM01]
+    language: python
+    any:
+      - $SYS = f"$$$A{$VAR}$$$B"
+    none_in_file:
+      - '{"role": "user", "content": $SYS}'
+    description: d
+    remediation: r
+"#;
+
+/// A prompt assembled with an f-string and then sent as a `role: "user"`
+/// message anywhere in the file is dropped, even though the `any` pattern
+/// alone would have matched the assignment.
+#[test]
+fn none_in_file_drops_a_prompt_sent_in_the_user_role() {
+    let rules = RuleSet::from_yaml(USER_ROLE_RULE_PY).unwrap();
+    let source = "def chat(client, query):\n    prompt = f\"Summarize: {query}\"\n    return client.x(messages=[{\"role\": \"user\", \"content\": prompt}])\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("app.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+/// The same shape sent as a `role: "system"` message instead has nothing to
+/// exclude it, and is still reported.
+#[test]
+fn none_in_file_keeps_a_prompt_sent_in_the_system_role() {
+    let rules = RuleSet::from_yaml(USER_ROLE_RULE_PY).unwrap();
+    let source = "def chat(client, query):\n    prompt = f\"Follow: {query}\"\n    return client.x(messages=[{\"role\": \"system\", \"content\": prompt}])\n";
+    assert_eq!(scan_source(&rules, Path::new("app.py"), source).len(), 1);
+}
+
+/// A `role: "user"` message that sends a *different* variable does not
+/// exclude the candidate: the exclusion pattern must bind `$SYS` to the same
+/// text the candidate bound, not merely find a user-role message somewhere.
+#[test]
+fn none_in_file_requires_the_same_bound_text() {
+    let rules = RuleSet::from_yaml(USER_ROLE_RULE_PY).unwrap();
+    let source = "def chat(client, query, other):\n    prompt = f\"Follow: {query}\"\n    return client.x(messages=[{\"role\": \"user\", \"content\": other}])\n";
+    assert_eq!(scan_source(&rules, Path::new("app.py"), source).len(), 1);
+}
+
+/// Matching is on text, not on binding: a same-named variable sent in the
+/// user role anywhere in the file suppresses the candidate. Accepted, and
+/// pinned here so a change to it is deliberate.
+#[test]
+fn none_in_file_matches_on_text_across_functions() {
+    let rules = RuleSet::from_yaml(USER_ROLE_RULE_PY).unwrap();
+    let source = "def a(query):\n    prompt = f\"Follow: {query}\"\n    return prompt\n\ndef b(client, prompt):\n    return client.x(messages=[{\"role\": \"user\", \"content\": prompt}])\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("app.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+/// The same exclusion works against a TypeScript/JavaScript grammar, not
+/// just Python.
+#[test]
+fn none_in_file_works_for_typescript() {
+    let yaml = r#"
+rules:
+  - id: BAS-NIF-002
+    title: t
+    kind: observation
+    severity: high
+    confidence: high
+    categories: [LLM01]
+    language: javascript
+    any:
+      - "const $SYS = `$$$A${$VAR}$$$B`"
+    none_in_file:
+      - '{role: "user", content: $SYS}'
+    description: d
+    remediation: r
+"#;
+    let rules = RuleSet::from_yaml(yaml).unwrap();
+    let source = "export function m(query: string) {\n  const prompt = `S: ${query}`;\n  return [{role: \"system\", content: \"x\"}, {role: \"user\", content: prompt}];\n}\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("app.ts"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+/// A `none_in_file` pattern naming a metavariable no `any` pattern binds
+/// fails to load, the same as `flow.unproven.requires` does.
+#[test]
+fn none_in_file_naming_an_unbound_metavariable_fails_to_load() {
+    let yaml = USER_ROLE_RULE_PY.replace("$SYS}'", "$OTHER}'");
+    let err = RuleSet::from_yaml(&yaml).unwrap_err();
+    assert!(
+        matches!(err, RuleError::UnboundMetavariable { ref var, .. } if var == "OTHER"),
+        "{err}"
+    );
+}
+
+/// `flow.sink` and `none_in_file` on the same rule fails to load: the
+/// wrapper-sink pass that `flow.sink` turns on builds its findings straight
+/// from `wrapper_sink_calls`, never through `CompiledRule::excluded_by_file`,
+/// so a `none_in_file` exclusion on such a rule would be silently skipped for
+/// every finding the wrapper pass reports.
+#[test]
+fn flow_sink_combined_with_none_in_file_fails_to_load() {
+    let yaml = r"
+rules:
+  - id: BAS-NIF-003
+    title: t
+    kind: defect
+    severity: critical
+    confidence: high
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      source: model_output
+      sink: code_execution
+    none_in_file:
+      - exec($ARG)
+    description: d
+    remediation: r
+";
+    let err = RuleSet::from_yaml(yaml).unwrap_err();
+    assert!(
+        matches!(err, RuleError::FlowSinkWithNoneInFile { ref id } if id == "BAS-NIF-003"),
+        "{err}"
+    );
+}
+
+/// A rule that reports a bind-all address only in a file that also builds the
+/// HTTP transport; `requires_in_file` has no metavariables, like the anonymous
+/// `none_in_file` patterns.
+const REQUIRES_RULE_TS: &str = r#"
+rules:
+  - id: BAS-RIF-001
+    title: t
+    kind: observation
+    severity: low
+    confidence: high
+    categories: [ZT3]
+    language: javascript
+    any:
+      - '$APP.listen($PORT, "0.0.0.0")'
+    requires_in_file:
+      - 'new StreamableHTTPServerTransport($$$)'
+    description: d
+    remediation: r
+"#;
+
+#[test]
+fn requires_in_file_keeps_a_match_when_the_required_pattern_is_present() {
+    let rules = RuleSet::from_yaml(REQUIRES_RULE_TS).unwrap();
+    let source =
+        "const t = new StreamableHTTPServerTransport({});\napp.listen(3000, \"0.0.0.0\");\n";
+    assert_eq!(scan_source(&rules, Path::new("s.ts"), source).len(), 1);
+}
+
+#[test]
+fn requires_in_file_drops_a_match_when_the_required_pattern_is_absent() {
+    let rules = RuleSet::from_yaml(REQUIRES_RULE_TS).unwrap();
+    let source = "app.listen(3000, \"0.0.0.0\");\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("s.ts"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+#[test]
+fn requires_in_file_accepts_any_one_of_several_patterns() {
+    let yaml = REQUIRES_RULE_TS.replace(
+        "      - 'new StreamableHTTPServerTransport($$$)'",
+        "      - 'new StreamableHTTPServerTransport($$$)'\n      - 'new SSEServerTransport($$$)'",
+    );
+    let rules = RuleSet::from_yaml(&yaml).unwrap();
+    let source = "const t = new SSEServerTransport(\"/m\", res);\napp.listen(3000, \"0.0.0.0\");\n";
+    assert_eq!(scan_source(&rules, Path::new("s.ts"), source).len(), 1);
+}
+
+#[test]
+fn requires_in_file_combines_with_none_in_file() {
+    let yaml = REQUIRES_RULE_TS.replace(
+        "    description: d",
+        "    none_in_file:\n      - 'requireBearerAuth($$$)'\n    description: d",
+    );
+    let rules = RuleSet::from_yaml(&yaml).unwrap();
+    let guarded = "const t = new StreamableHTTPServerTransport({});\nrequireBearerAuth({});\napp.listen(3000, \"0.0.0.0\");\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("s.ts"), guarded),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+#[test]
+fn requires_in_file_works_for_python() {
+    let yaml = r#"
+rules:
+  - id: BAS-RIF-002
+    title: t
+    kind: observation
+    severity: low
+    confidence: high
+    categories: [ZT3]
+    language: python
+    any:
+      - 'uvicorn.run($APP, host="0.0.0.0")'
+    requires_in_file:
+      - '$_.streamable_http_app()'
+    description: d
+    remediation: r
+"#;
+    let rules = RuleSet::from_yaml(yaml).unwrap();
+    let hit = "app = mcp.streamable_http_app()\nuvicorn.run(app, host=\"0.0.0.0\")\n";
+    assert_eq!(scan_source(&rules, Path::new("s.py"), hit).len(), 1);
+    let miss = "uvicorn.run(app, host=\"0.0.0.0\")\n";
+    assert_eq!(scan_source(&rules, Path::new("s.py"), miss).len(), 0);
+}
+
+/// A candidate from an `any` pattern that does not bind a metavariable the
+/// required pattern uses has nothing to compare, so the requirement is not
+/// met and the match is dropped. `none_in_file` behaves the other way round:
+/// with nothing to compare, it does not exclude.
+#[test]
+fn requires_in_file_drops_a_candidate_that_did_not_bind_the_shared_metavariable() {
+    let yaml = r#"
+rules:
+  - id: BAS-RIF-003
+    title: t
+    kind: observation
+    severity: low
+    confidence: high
+    categories: [ZT3]
+    language: javascript
+    any:
+      - '$APP.listen($PORT, "0.0.0.0")'
+      - 'serve("0.0.0.0")'
+    requires_in_file:
+      - 'new Transport($PORT)'
+    description: d
+    remediation: r
+"#;
+    let rules = RuleSet::from_yaml(yaml).unwrap();
+    let bound = "new Transport(3000);\napp.listen(3000, \"0.0.0.0\");\n";
+    assert_eq!(scan_source(&rules, Path::new("s.ts"), bound).len(), 1);
+    let unbound = "new Transport(3000);\nserve(\"0.0.0.0\");\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("s.ts"), unbound),
+        Vec::<crate::finding::Finding>::new()
+    );
+    let excluded = yaml.replace("requires_in_file", "none_in_file");
+    let rules = RuleSet::from_yaml(&excluded).unwrap();
+    assert_eq!(scan_source(&rules, Path::new("s.ts"), unbound).len(), 1);
+}
+
+#[test]
+fn requires_in_file_naming_an_unbound_metavariable_fails_to_load() {
+    let yaml = REQUIRES_RULE_TS.replace("new StreamableHTTPServerTransport($$$)", "new T($OTHER)");
+    let err = RuleSet::from_yaml(&yaml).unwrap_err();
+    assert!(
+        matches!(err, RuleError::UnboundMetavariable { ref var, ref field, .. } if var == "OTHER" && field == "requires_in_file"),
+        "{err}"
+    );
+}
+
+#[test]
+fn flow_sink_combined_with_requires_in_file_fails_to_load() {
+    let yaml = r"
+rules:
+  - id: BAS-RIF-003
+    title: t
+    kind: defect
+    severity: critical
+    confidence: high
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      source: model_output
+      sink: code_execution
+    requires_in_file:
+      - 'import os'
+    description: d
+    remediation: r
+";
+    let err = RuleSet::from_yaml(yaml).unwrap_err();
+    assert!(
+        matches!(err, RuleError::FlowSinkWithRequiresInFile { ref id } if id == "BAS-RIF-003"),
+        "{err}"
     );
 }

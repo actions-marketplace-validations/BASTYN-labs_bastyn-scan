@@ -1,4 +1,4 @@
-name: Instant AI Agent Security & Assurance scan - BASTYN community
+name: Instant AI Agent Security & Assurance scan - BASTYN Community
 description: Instant SAST for AI agents and MCP. Detect unsafe actions, security flaws, and control gaps in CI/CD before deployment.
 author: Bastyn Labs
 
@@ -25,7 +25,7 @@ inputs:
       tagged for, so pinning the action pins the binary. Pass "latest" to
       always take the newest release instead.
     required: false
-    default: v0.1.6
+    default: v0.8.0
   format:
     description: Output format written to the log. One of text, json, or sarif.
     required: false
@@ -40,6 +40,10 @@ inputs:
     default: high
   show-observations:
     description: Include context-dependent observations alongside defects.
+    required: false
+    default: "false"
+  show-coverage:
+    description: List every file the scan read in the text report, grouped by kind. Without it the report prints only counts.
     required: false
     default: "false"
   offline:
@@ -116,6 +120,7 @@ runs:
         SARIF_FILE: ${{ inputs.sarif-file }}
         FAIL_ON: ${{ inputs.fail-on }}
         SHOW_OBSERVATIONS: ${{ inputs.show-observations }}
+        SHOW_COVERAGE: ${{ inputs.show-coverage }}
         OFFLINE: ${{ inputs.offline }}
         EXCLUDE: ${{ inputs.exclude }}
       run: |
@@ -138,6 +143,7 @@ runs:
         args=(scan "$SCAN_PATH" --format "$SCAN_FORMAT" --fail-on "$FAIL_ON")
         (( ${#exclude_args[@]} )) && args+=("${exclude_args[@]}")
         [ "$SHOW_OBSERVATIONS" = "true" ] && args+=(--show-observations)
+        [ "$SHOW_COVERAGE" = "true" ] && args+=(--show-coverage)
         [ "$OFFLINE" = "true" ] && args+=(--offline)
 
         # SARIF always goes to a file when asked for, independently of the

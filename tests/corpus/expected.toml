@@ -34,27 +34,27 @@ file     = "vulnerable/llm01_prompt_injection.py"
 line     = 26
 rule     = "BAS-ZT4-001"
 category = "LLM01"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "An internal wiki runbook page -- editable by anyone -- is folded straight into the agent's instructions with no delimiter separating instructions from untrusted content."
+why      = "An internal wiki runbook page -- editable by anyone -- is folded straight into the agent's instructions with no delimiter separating instructions from untrusted content. Reported as an observation: the value's origin is outside this file (a parameter or an untraced name), so the engine cannot prove it untrusted."
 
 [[expect]]
 file     = "vulnerable/llm03_excessive_agency.py"
 line     = 9
 rule     = "BAS-LLM03-001"
 category = "LLM03"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "shutdown_server is a destructive tool exposed via @tool with no confirmation guard before it acts."
+why      = "shutdown_server is a destructive tool exposed via @tool with no confirmation guard before it acts. Reported as an observation: the tool's name is the only evidence it changes state."
 
 [[expect]]
 file     = "vulnerable/llm03_excessive_agency.py"
 line     = 29
 rule     = "BAS-LLM03-001"
 category = "LLM03"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "update_server_config is a state-changing tool exposed via @tool with no confirmation guard -- not named with a delete/drop/... verb, the exact gap the head-to-head benchmark against a Python prototype exposed: the prototype flagged all 8 undecorated tool functions in a real repository's file and Bastyn caught only the one destructively-named one."
+why      = "update_server_config is a state-changing tool exposed via @tool with no confirmation guard, not named with a delete/drop/... verb. Reported as an observation: the tool's name is the only evidence it changes state."
 
 [[expect]]
 file     = "vulnerable/llm06_unbounded_consumption.py"
@@ -95,18 +95,205 @@ why      = "The model's suggested shell one-liner is run with subprocess.run(...
 [[expect]]
 file     = "vulnerable/llm10_eval_on_model_reply.py"
 line     = 59
-rule     = "BAS-LLM10-003"
+rule     = "BAS-LLM10-017"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "The f-string interpolates both a traced model reply and an untraced parameter directly into raw SQL, with neither bound as a query parameter -- an unconditional SQL-injection shape regardless of provenance, exactly BAS-LLM10-017's designed scope (the same unconditional-composition philosophy BAS-LLM10-009 applies to shell commands: it reports the composition itself, independent of whatever precedes or feeds it). BAS-LLM10-003's mixed-origin downgrade to an observation exists for cases where provenance can't be established and that absence matters for calibrating confidence; here it doesn't need to, since parameterization is the correct fix regardless of source. BAS-LLM10-003 still fires and is preserved as a secondary_rule_ids entry on this finding, so nothing is silently lost -- it just isn't the top-level displayed finding at this line."
+
+[[expect]]
+file     = "vulnerable/model_output_renamed.py"
+line     = 6
+rule     = "BAS-LLM10-002"
 category = "LLM10"
 kind     = "defect"
 severity = "critical"
-why      = "The model's reply is concatenated straight into an INSERT statement -- SQL injection with the model as the delivery mechanism."
+why      = "Model output reaches a shell with shell=True through a variable named `command`, which no name list contains. Found through provenance, not the name."
+
+[[expect]]
+file     = "vulnerable/model_output_renamed.py"
+line     = 11
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "Model output becomes SQL query text through a variable named `statement`. BAS-LLM10-003 and BAS-LLM10-008 both match; the report merges them."
+
+[[expect]]
+file     = "vulnerable/model_output_renamed.py"
+line     = 16
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "Model output formatted into SQL with str.format. The flow graph carries the argument's provenance through .format."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_tool.py"
+line     = 29
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "host is interpolated into a shell command with no validation at all."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_tool.py"
+line     = 39
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "the allowlist only inspects the command's first token, then the whole string reaches a shell. run_allowlisted_command() is decorated @mcp.tool() -- a recognized entry point -- so it must stay a defect rather than being downgraded by flow.passthrough_downgrade."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_tool.py"
+line     = 51
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "the denylist blocks a few substrings; anything else still reaches a shell unrestricted. run_denylisted_command() is decorated @mcp.tool() -- same reasoning as run_allowlisted_command() above."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_tool.py"
+line     = 65
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_playbook_partially_quoted(): every interpolated segment except extra_args is wrapped in shlex.quote(), but one unquoted segment is enough to break out of the argument that shlex.quote() would otherwise have produced -- BAS-LLM10-009's exclude_if: shell_quoted clause must not suppress this, since is_shell_quoted() ANDs across every interpolation and one unquoted interpolation makes the whole expression not shell_quoted. Also unaffected by flow.passthrough_downgrade: ARG is an f-string mixing three different parameters, which resolves Origin::Unknown, not Origin::Parameter."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_tool.py"
+line     = 78
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "unpack(): tmpdir is tempfile.mkdtemp()'s OS-generated directory (tempfile-closed, so BAS-LLM10-009's exclude_if: closed_value tempfile handling would otherwise drop this command), but archive_name is a real caller-supplied parameter interpolated into the same shell command -- Resolved::combine ANDs closed across every f-string segment, so one non-closed segment keeps the whole command non-closed and this must still fire, the same 'one segment breaks the exclusion' shape run_playbook_partially_quoted() above proves for shell_quoted. Also unaffected by flow.passthrough_downgrade: ARG is an f-string mixing a call result (tmpdir) with a parameter (archive_name), which resolves Origin::Unknown, not Origin::Parameter."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_tool.py"
+line     = 89
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "make_workspace(): tempfile.mkdtemp(prefix=prefix) is only OS-generated end to end when called with no arguments -- called with a caller-supplied prefix, the returned path is not closed, since exclude_if: closed_value now requires every argument passed to a tempfile-closed callee to itself be closed (or there to be no arguments at all), the same all-args-must-be-safe pattern already applied to os.path.join and similar pure path-construction functions."
+
+[[expect]]
+file     = "vulnerable/shell_command_not_stdin_sourced.py"
+line     = 10
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "command is read from a config file, not stdin -- must still fire after the stdin_dispatch narrowing added to BAS-LLM10-009's exclude_if clause; guards against is_stdin_dispatch() being implemented too broadly."
+
+[[expect]]
+file     = "vulnerable/llm10_path_traversal_tool.py"
+line     = 21
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "filename is joined onto the runbook directory and opened with no realpath/containment check."
+
+[[expect]]
+file     = "vulnerable/llm10_path_traversal_tool.py"
+line     = 34
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "the containment check tests the unresolved string; the open() call has no realpath wrapper."
+
+[[expect]]
+file     = "vulnerable/llm10_path_traversal_tool.py"
+line     = 44
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "asset_root is a function parameter, not a module-level __file__-derived constant -- BAS-LLM10-012's new exclude_if: constant_path clause (added 2026-09-24 to fix 6 of 7 report false positives, all the module-level __file__-derived-constant shape) does not, and by design cannot without interprocedural call-site analysis, prove a bare parameter safe, so this must still fire."
+
+[[expect]]
+file     = "vulnerable/llm10_path_traversal_tool.py"
+line     = 60
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "HERE is a module-level, pathlib Path(__file__)-derived constant_path, but name is a function parameter interpolated into the same f-string as HERE -- exclude_if: constant_path ANDs constant_path across every interpolation, so a parameter mixed in with an otherwise-constant f-string must still fire."
+
+[[expect]]
+file     = "vulnerable/llm10_path_traversal_tool.py"
+line     = 77
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "args.root traces to the operator's own command line (a genuine argparse.ArgumentParser().parse_args()) -- BAS-LLM10-012's exclude_if: cli_argument clause would suppress that half on its own -- but it is joined with request.args[\"f\"], flask's own HTTP query-parameter dict, a second non-literal segment cli_argument knows nothing about. Both exclude_if: constant_path and exclude_if: cli_argument AND their predicate across every argument of os.path.join, so mixing one CLI-sourced segment with one HTTP-sourced segment must still fire."
+
+[[expect]]
+file     = "vulnerable/llm10_unparameterized_sql_tool.py"
+line     = 9
+rule     = "BAS-LLM10-017"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "the query is f-string interpolated directly into execute(), with no variable-name gate needed."
+
+[[expect]]
+file     = "vulnerable/llm10_unparameterized_sql_tool.py"
+line     = 12
+rule     = "BAS-LLM10-018"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "archive_stale_ticket(): sql = f\"UPDATE ...{ticket_id}\"; cursor.execute(sql) with nothing after the execute() call -- a fire-and-forget write, the most common real shape for INSERT/UPDATE/DELETE. Regression fixture for a 2026-09-23 review finding: BAS-LLM10-018's def-wrapped pattern required its trailing $$$REST capture to bind at least one statement after execute(), so this exact shape (execute() as the function's literal last statement) produced no finding until the rule gained sibling any: variants with no $$$REST tail (see bastyn.yml's comment on BAS-LLM10-018). Reported at the def line (12), same as this rule's other entries, since the matched root is still the whole enclosing function."
+
+[[expect]]
+file     = "vulnerable/llm10_unparameterized_sql_tool.py"
+line     = 27
+rule     = "BAS-LLM10-018"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "plain_parameter_sql_through_local_variable(): moved here from clean/near_misses.py on 2026-09-23, where it had originally proved BAS-LLM10-008 stays silent on a bare, non-tool function parameter (Origin::Parameter, never Origin::Call{...}, so it can never classify as model_output). That is still true and BAS-LLM10-008 does not fire here. But BAS-LLM10-018 has no provenance gate at all -- it fires on the interpolate-then-execute shape alone, exactly like BAS-LLM10-017 and BAS-LLM10-009 do, regardless of where the value came from -- so once the last-statement parsing gap above was fixed, this became a genuine BAS-LLM10-018 true positive and the function no longer belonged in a file whose whole point is that nothing in it should fire."
+
+[[expect]]
+file     = "vulnerable/llm10_unparameterized_sql_tool.py"
+line     = 53
+rule     = "BAS-LLM10-017"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "find_ticket_by_customer(): customer_email is interpolated as a query *value* into a WHERE clause, not a schema identifier -- the 2026-09-24 metavariable_not_matches DDL-keyword exclusion (added to fix all 4 BAS-LLM10-017 report false positives, all PRAGMA table_info(...)/ALTER TABLE ... ADD COLUMN ... identifier interpolation) only excludes an f-string that opens with PRAGMA/ALTER TABLE/CREATE TABLE/DROP TABLE/CREATE INDEX/DROP INDEX, and this f-string opens with SELECT, so it must still fire -- proving the exclusion does not over-broadly swallow real injections."
+
+[[expect]]
+file     = "vulnerable/llm10_unparameterized_sql_tool.py"
+line     = 65
+rule     = "BAS-LLM10-017"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "materialize_filtered_table(): opens with CREATE TABLE, but also interpolates user_filter as a real query value (quoted with the opposite quote character) in a WHERE clause appended to the DDL. Regression fixture for a 2026-09-24 final-review finding: the DDL exclusion originally checked only the opening keyword, not whether a quoted value literal appeared anywhere in the rest of the string, so this was wrongly excluded before the exclusion regex was tightened to require the whole remainder be quote-free."
+
+[[expect]]
+file     = "vulnerable/llm10_unparameterized_sql_tool.py"
+line     = 73
+rule     = "BAS-LLM10-017"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "add_column_with_default(): opens with ALTER TABLE, but DEFAULT '{user_filter}' interpolates a real query value, not a schema identifier -- the ADD COLUMN counterpart to materialize_filtered_table() above, same 2026-09-24 regression and same tightened exclusion."
 
 [[expect]]
 file     = "vulnerable/zt1_static_credentials.py"
 line     = 13
 rule     = "BAS-ZT1-001"
 category = "ZT1"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "A real-looking OpenAI key is committed straight into source instead of coming from the environment or a secret manager."
 
@@ -124,9 +311,27 @@ file     = "vulnerable/zt4_no_delimiter.py"
 line     = 14
 rule     = "BAS-ZT4-001"
 category = "ZT4"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "A customer's raw, fully untrusted ticket text is concatenated directly into the persona instructions with no delimiter or separate message role."
+why      = "A customer's raw, fully untrusted ticket text is concatenated directly into the persona instructions with no delimiter or separate message role. Reported as an observation: the value's origin is outside this file (a parameter or an untraced name), so the engine cannot prove it untrusted."
+
+[[expect]]
+file     = "vulnerable/system_prompt_from_parameter.py"
+line     = 2
+rule     = "BAS-ZT4-001"
+category = "ZT4"
+kind     = "observation"
+severity = "high"
+why      = "A function parameter interpolated into a prompt sent in the system role. The parameter's origin is outside this file, so the engine cannot prove it untrusted: reported as an observation, not a defect."
+
+[[expect]]
+file     = "vulnerable/system_prompt_from_request.py"
+line     = 6
+rule     = "BAS-ZT4-001"
+category = "ZT4"
+kind     = "observation"
+severity = "high"
+why      = "HTTP request data (request.get_json()) interpolated into a prompt sent in the system role."
 
 [[expect]]
 file     = "vulnerable/zt2_wildcard_tool_grant.py"
@@ -169,7 +374,7 @@ file     = "vulnerable/latest/config.py"
 line     = 16
 rule     = "BAS-ZT1-002"
 category = "ZT1"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "`latest/` contains the letters \"test\" and is not a test directory. This stays a defect; a substring-based test-path check would silently demote a real hardcoded credential in shipped configuration."
 
@@ -211,6 +416,15 @@ category = "LLM04"
 why      = "certifi==2022.12.7 has real published advisories. Same offline-network gap as the requests entry above."
 requires_network = true
 
+[[expect]]
+file     = "vulnerable/llm04_supply_chain/requirements.txt"
+line     = 16
+rule     = "BAS-LLM04-001"
+category = "LLM04"
+kind     = "observation"
+severity = "low"
+why      = "langchain>=0.1 is a range, not a pin: an observation that the installed version is not fixed by this file."
+
 [[known_gap]]
 file     = "vulnerable/llm09_vector_embedding_weaknesses.py"
 line     = 21
@@ -229,6 +443,50 @@ line     = 22
 category = "ZT6"
 why      = "A tool call that bypasses the audited call path and reaches the infra client directly, leaving no record of which ticket or session triggered it. Needs cross-referencing two call sites; no rule expresses that."
 
+# vulnerable/dotenv_leak/.env and clean/dotenv_example/.env.example exist as
+# fixtures (see README.md-style live-reproduction commands in the dotenv
+# analyser's own PR/task notes) but carry no [[expect]]/[[expect_none]] entry
+# here, deliberately: walk.rs's own doc comment scopes the .env/.env.*
+# always-walk allowlist to "the scan root" -- collect_files's allowlist pass
+# only looks one level below whatever root it is handed. This corpus's own
+# gate (see this file's header comment and corpus_gate.rs's module doc)
+# scans `tests/corpus` exactly once, as a single root, so a .env file nested
+# two levels below it (vulnerable/dotenv_leak/.env) is not a hidden dotfile
+# at *that* scan's root and is therefore never walked in this gate at all --
+# not found, not skipped, invisible -- regardless of whether dotenv.rs
+# detects it correctly. Confirmed directly: scanning tests/corpus as a whole
+# produces zero findings and zero skipped entries mentioning either fixture.
+# This is a reachability limit of running one shared corpus scan over many
+# independent fixture directories, not a detection gap in BAS-ZT1-021/022,
+# so recording it as [[known_gap]] would misattribute a harness limitation
+# as a rule weakness. The actual regression coverage for "is .env wired into
+# scan()" lives in crates/bastyn-core/src/scan.rs's own test module
+# (dot_env_credentials_are_analysed_by_the_scan and its .env.example sibling)
+# and crates/bastyn-core/src/dotenv.rs's own unit tests, both of which scan a
+# tree with .env genuinely at its root, matching walk.rs's real allowlist
+# scope. These two fixture directories remain in the corpus tree purely as a
+# hand-runnable reproduction of the original bug report (`cargo run
+# --release -p bastyn -- tests/corpus/vulnerable/dotenv_leak`).
+#
+# clean/dotenv_multi_segment_example/.env.local.example and
+# clean/dotenv_placeholder_value/.env are the same kind of fixture, added for
+# a later false-positive report against BAS-ZT1-021/022: (1) a per-environment
+# example file (`.env.local.example`) that a placeholder-suffix check used to
+# miss because it checked the whole remainder after ".env." rather than just
+# the final segment, and (2) a genuine, non-example `.env` holding an obvious
+# placeholder value (`sk-your-key-here-...`, `sk-REPLACE_WITH_YOUR_...`) that
+# `is_provider_key_literal` used to accept on shape alone. Both are two levels
+# below this corpus's single scan root, so the same reachability limit above
+# applies and neither carries an [[expect_none]] entry here. The real
+# regression coverage lives in crates/bastyn-core/src/dotenv.rs's own unit
+# tests (a_multi_segment_placeholder_suffix_file_is_never_flagged,
+# a_placeholder_shaped_value_in_a_genuine_env_file_is_not_flagged) and
+# crates/bastyn-core/src/credential.rs's own unit tests
+# (a_provider_key_shaped_placeholder_is_not_reported). Hand-runnable
+# reproduction: `cargo run --release -p bastyn -- scan
+# tests/corpus/clean/dotenv_multi_segment_example` /
+# `tests/corpus/clean/dotenv_placeholder_value`.
+
 # ---------------------------------------------------------------------
 # vulnerable/real_misses/ — the four real misses measured against a
 # production agentic app (see README.md for the measurement).
@@ -241,7 +499,7 @@ rule     = "BAS-LLM10-004"
 category = "LLM10"
 kind     = "defect"
 severity = "high"
-why      = "eval(compile(model_reply, ...)) -- the taint is one hop away from the model reply through a local variable named `compiled`. BAS-LLM10-004 drops the response/reply/... name requirement and flags eval()/exec() on any non-literal argument."
+why      = "eval(compile(model_reply, ...)) -- the taint is one hop away from the model reply through a local variable named `compiled`. BAS-LLM10-004 drops the response/reply/... name requirement and flags eval()/exec() on any non-literal argument. Reported as a defect: since 2026-09-25 this rule no longer gates on provenance at all, so an untraceable origin (a parameter, or a value one hop from one) no longer downgrades or drops the finding."
 
 [[expect]]
 file     = "vulnerable/real_misses/exec_with_globals_dict.py"
@@ -250,23 +508,59 @@ rule     = "BAS-LLM10-004"
 category = "LLM10"
 kind     = "defect"
 severity = "high"
-why      = "exec(manifest[\"setup_code\"], namespace) -- an explicit globals dict as the second argument. Found via an external security-gap report against a benchmark repo (opsdesk-agent, not part of this file's own 65-repo corpus measurement): BAS-LLM10-004 used to match only the single-argument shape, so the 2-arg call was silently missed."
+why      = "exec(manifest[\"setup_code\"], namespace) -- an explicit globals dict as the second argument. BAS-LLM10-004 used to match only the single-argument shape, so the 2-arg call was silently missed. Reported as a defect: since 2026-09-25 this rule no longer gates on provenance at all, so an untraceable origin (a parameter, or a value one hop from one) no longer downgrades or drops the finding."
+
+[[expect]]
+file     = "vulnerable/llm10_eval_letters_in_class.py"
+line     = 9
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "eval() on a parameter: the full-match class admits letters and underscores, so the value can still spell names and calls."
+
+[[expect]]
+file     = "vulnerable/llm10_eval_letters_in_class.py"
+line     = 17
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "eval() on a parameter: re.search without anchors only proves one allowed character is present, not that the whole value is limited."
+
+[[expect]]
+file     = "vulnerable/llm10_eval_letters_in_class.py"
+line     = 25
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "eval() on a parameter: the checked name is reassigned after the check, so the guard no longer describes the evaluated value."
+
+[[expect]]
+file     = "vulnerable/real_misses/eval_on_untraceable_parameter.py"
+line     = 35
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "eval(expression) on a bare function parameter with no catalogued source at all -- not one hop from a known source, just entirely unclassifiable. Before 2026-09-25 this was the canonical `unproven` case: hidden behind flow.unproven as an observation, invisible without --show-observations. BAS-LLM10-004 now drops the source gate entirely, so this reports as a defect."
 
 [[expect]]
 file     = "vulnerable/real_misses/overridable_system_prompt.py"
 line     = 19
 rule     = "BAS-ZT4-002"
 category = "LLM01"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "A caller-supplied override fully replaces the system prompt (f\"System: {override}{context}\\n\\nUser: {user_input}\"). BAS-ZT4-002 accepts more than one interpolation, gated on the first being override-shaped."
+why      = "A caller-supplied override fully replaces the system prompt (f\"System: {override}{context}\\n\\nUser: {user_input}\"). BAS-ZT4-002 accepts more than one interpolation, gated on the first being override-shaped. Reported as an observation: the value's origin is outside this file (a parameter or an untraced name), so the engine cannot prove it untrusted."
 
 [[expect]]
 file     = "vulnerable/real_misses/hardcoded_dict_secrets.py"
 line     = 15
 rule     = "BAS-ZT1-002"
 category = "ZT1"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "A live database URL with an inline password, as a dict literal value (\"database_url\": \"postgresql://admin:password123@...\"). BAS-ZT1-002 gates on the value's own credential shape rather than an assignment target."
 
@@ -275,54 +569,71 @@ file     = "vulnerable/real_misses/hardcoded_dict_secrets.py"
 line     = 16
 rule     = "BAS-ZT1-002"
 category = "ZT1"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "An admin token as a dict literal value (\"admin_secret\": \"SUPER-SECRET-TOKEN-...\"). Same dict-literal shape as the database_url entry above."
+
+[[expect]]
+file     = "vulnerable/real_misses/hardcoded_dict_secrets.py"
+line     = 31
+rule     = "BAS-ZT1-002"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "A database URL with an inline password (postgresql://svc:hunter2@...) as a dict literal value. Same shape as the line-15 entry, in the second function."
 
 [[expect]]
 file     = "vulnerable/real_misses/override_or_fallback_prompt.py"
 line     = 28
 rule     = "BAS-ZT4-002"
 category = "LLM01"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "`system_prompt = system_override or self._build_system_prompt(...)` -- the caller's override replaces the instruction channel outright. Measured 2026-08-28: this is the only caller-supplied prompt override in 65 real repositories, and it is an `or` fallback, not the f-string interpolation BAS-ZT4-002 was originally written against."
+why      = "`system_prompt = system_override or self._build_system_prompt(...)` -- the caller's override replaces the instruction channel outright. This is an `or` fallback, not the f-string interpolation BAS-ZT4-002 was originally written against. Reported as an observation: the value's origin is outside this file (a parameter or an untraced name), so the engine cannot prove it untrusted."
 
 [[expect]]
 file     = "vulnerable/real_misses/header_override_self_concat.py"
 line     = 36
 rule     = "BAS-ZT4-002"
 category = "LLM01"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "system_prompt = system_prompt + x_agent_goal_override -- a header-sourced override self-concatenated onto the system prompt. Found via an external security-gap report against a benchmark repo (opsdesk-agent, not part of this file's own 65-repo corpus measurement): BAS-ZT4-002 had no self-concatenation shape, so this was silently missed regardless of which FastAPI idiom sourced the header value."
+why      = "system_prompt = system_prompt + x_agent_goal_override -- a header-sourced override self-concatenated onto the system prompt. BAS-ZT4-002 had no self-concatenation shape, so this was silently missed regardless of which FastAPI idiom sourced the header value. Reported as an observation: the value's origin is outside this file (a parameter or an untraced name), so the engine cannot prove it untrusted."
 
 [[expect]]
 file     = "vulnerable/real_misses/sql_through_local_variable.py"
 line     = 41
-rule     = "BAS-LLM10-008"
 category = "LLM10"
 kind     = "defect"
 severity = "critical"
-why      = "sql = f\"...{refined_query}%'\"; cursor.execute(sql) -- the model's reply reaches SQL through one local f-string reassignment. Found via an external security-gap report against a benchmark repo (opsdesk-agent, not part of this file's own 65-repo corpus measurement): BAS-LLM10-003's name-gate never sees a variable named `sql`, so this was silently missed; BAS-LLM10-008 asks the flow graph instead of guessing from the variable's name."
+why      = "sql = f\"...{refined_query}%'\"; cursor.execute(sql) -- the model's reply reaches SQL through one local f-string reassignment. BAS-LLM10-003's former name gate never saw a variable named `sql`; both BAS-LLM10-003 and BAS-LLM10-008 now trace it through the flow graph, and the report merges them."
+
+[[expect]]
+file     = "vulnerable/real_misses/sql_through_local_variable.py"
+line     = 29
+rule     = "BAS-LLM10-018"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "the same interpolate-then-execute shape BAS-LLM10-018 catches unconditionally, co-firing alongside the existing model-output-gated BAS-LLM10-008 finding at the same location. BAS-LLM10-018's matched pattern is the whole enclosing function (def $FN($$$ARGS) -> $RET:\\n    $$$PRE\\n    $SQL = f\"...\"\\n    $CUR.execute($SQL)\\n    $$$REST, needed because ast_grep_core's Pattern::try_new refuses a two-statement pattern with no shared parent as 'Multiple AST nodes'), so the reported location is the def line (29), not the assignment (40) or execute() (41) line."
 
 [[expect]]
 file     = "vulnerable/real_misses/eval_expression_tool.js"
 line     = 26
 rule     = "BAS-LLM10-005"
 category = "LLM10"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "eval() on a model-supplied `expression` inside an agent tool. The variable is named for what the value is, which is what every real instance measured on 2026-08-28 did, so the old response/reply/... name gate could never fire -- BAS-LLM10-005 now gates on the argument not being a literal, exactly as BAS-LLM10-004 does for Python."
+why      = "eval() on a model-supplied `expression` inside an agent tool. The variable is named for what the value is, which is what every real instance measured on 2026-08-28 did, so the old response/reply/... name gate could never fire -- BAS-LLM10-005 now gates on the argument not being a literal, exactly as BAS-LLM10-004 does for Python. Reported as an observation: TypeScript/JavaScript has no dataflow graph to prove the value's origin."
 
 [[expect]]
 file     = "vulnerable/real_misses/eval_expression_tool.js"
 line     = 34
 rule     = "BAS-LLM10-005"
 category = "LLM10"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "new Function() on a template literal built from model-derived text. A template literal is not a fixed literal, so the `none:` exclusion does not cover it -- and should not."
+why      = "new Function() on a template literal built from model-derived text. A template literal is not a fixed literal, so the `none:` exclusion does not cover it -- and should not. Reported as an observation: TypeScript/JavaScript has no dataflow graph to prove the value's origin."
 
 [[known_gap]]
 file     = "vulnerable/real_misses/autonomous_action_from_model_text.py"
@@ -330,48 +641,93 @@ line     = 29
 category = "LLM03"
 why      = "The model is instructed to emit an EXECUTE_SIGNAL{...} marker; the app re.search()es for it and dispatches the embedded JSON with no confirmation. BAS-LLM03-001 only matches a destructive-named @tool function with a missing guard clause -- there is no tool function here at all, just free text parsed for a marker."
 
-[[known_gap]]
+[[expect]]
 file     = "vulnerable/real_misses/sql_from_tool_parameter.py"
-line     = 39
+line     = 33
+rule     = "BAS-LLM10-018"
 category = "LLM10"
-why      = "sql = f\"...{query}%'\"; cursor.execute(sql), where `query` is an @tool-decorated MCP handler's own parameter -- agent-controlled once you know it's a tool handler, but the flow graph resolves a bare parameter to Origin::Parameter, never Origin::Call{...}, and has no concept that a decorated tool function's parameters are untrusted. Would need a new SourceKind plus a decorator-recognition pass; genuinely separate, larger engine work, not attempted here."
+kind     = "defect"
+severity = "critical"
+why      = "sql = f\"...{query}%'\"; cursor.execute(sql), where `query` is an @tool-decorated MCP handler's own parameter. Promoted from known_gap on 2026-09-23: BAS-LLM10-018 catches the interpolate-then-execute shape unconditionally, without needing the new SourceKind plus decorator-recognition pass that flow-based Origin::Parameter tracking would have required -- it never asks where `query` came from, only whether an f-string-built local is executed on the very next line. BAS-LLM10-018's matched pattern is the whole enclosing function (see BAS-LLM10-018's comment in bastyn.yml for why: ast_grep_core's Pattern::try_new refuses a bare two-statement pattern as 'Multiple AST nodes', since the two statements share no parent node outside of one), so the reported location is the def line (33), not the known_gap's previously recorded line (39, the execute() call)."
+
+[[known_gap]]
+file     = "vulnerable/real_misses/path_traversal_bare_parameter.py"
+line     = 25
+category = "LLM10"
+why      = "open(filename) with no join/f-string/concat shape for BAS-LLM10-012's ARG gate to match; needs a bare-parameter variant or dataflow tracing."
+
+[[known_gap]]
+file     = "vulnerable/real_misses/path_traversal_variable_then_open.py"
+line     = 35
+category = "LLM10"
+why      = "path = os.path.join(RUNBOOK_DIR, filename) on the line above, then open(path) -- the join is genuinely there, but in a separate statement. BAS-LLM10-012's metavariable_matches only ever inspects the literal text of the captured $ARG node at the open() call site itself (RegexMatcher has no dataflow/definition resolution), so a bare `path` identifier can never match the os.path.join(/f-string/concat regex no matter what it was assigned to a line earlier. Distinct from path_traversal_bare_parameter.py, where the path is never assembled at all -- here it is assembled, just not inline."
+
+[[known_gap]]
+file     = "vulnerable/real_misses/shell_command_via_mutated_registry.py"
+line     = 44
+category = "LLM10"
+why      = "subprocess.run(COMMANDS[component], shell=True), where COMMANDS is a module-level dict genuinely mutated elsewhere in the file (COMMANDS[name] = cmd inside register()). crates/bastyn-core/src/flow/graph.rs's Analyzer::bind_targets only records a binding for a plain-identifier assignment target -- a subscript target (COMMANDS[name] = cmd) or an attribute-call receiver (CMDS.append(x)) both fall through its `_ => {}` arm and record nothing, so the graph never learns COMMANDS holds anything beyond its own dict-of-literals initializer. BAS-LLM10-009's exclude_if: closed_value clause therefore still resolves COMMANDS[component] as `closed: true` and wrongly suppresses this finding. Fixing this needs the graph to track mutated container names, a materially larger change than tracking a plain-identifier reassignment -- out of scope for this fix wave; recorded here rather than attempted."
 
 # ---------------------------------------------------------------------
-# vulnerable/real_misses/eval_guarded_by_local_check.py — the two entries
-# below run in the *opposite* direction from every `[[known_gap]]` above,
-# which is why they are a distinct entry type, `[[known_false_positive]]`,
-# rather than known_gap entries. A known_gap is a recall gap: a real defect
-# the engine is expected to miss. These are a precision gap: a safe call
-# BAS-LLM10-004 is expected to keep flagging anyway, because proving it
-# safe needs seeing a sibling statement (a prior assignment or guard
-# clause) that `none:`/`inside:` cannot reach -- both only ever look at the
-# matched node itself or its ancestors, never a sibling. See the file's own
-# docstring for the full investigation.
+# vulnerable/real_misses/eval_guarded_by_local_check.py used to carry two
+# `[[known_false_positive]]` entries here: BAS-LLM10-004 kept flagging an
+# eval() call whose argument a human could see was safe by reading a
+# sibling statement (a prior assignment or guard clause) that `none:`
+# (same-node only) and `inside:` (ancestors only) cannot reach. The flow
+# graph's provenance test reaches past that limit -- a value closed over a
+# name the program itself fixes, and a value a `not in (...)` guard
+# dominates, are both dropped directly -- so neither case is reported
+# anymore. See the file's own docstring and bastyn.yml's comment on
+# BAS-LLM10-004.
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Three of the four remaining false positives from the community precision
+# report that Tasks 4-7 did not close, each because closing it properly
+# needs an analysis materially larger than that round's scope
+# (dead-branch/constant-propagation, interprocedural call-site analysis,
+# and call-context distinction, respectively). Recorded here rather than
+# silently left out, same practice as every other entry in this file.
 #
-# Recorded here anyway, per this codebase's practice of writing every known
-# limitation down rather than leaving it silently untested (see README.md's
-# "detection is recorded as a known_gap, not quietly left out" -- the same
-# practice applies to known_false_positive). `corpus_gate`'s
-# `find_promotable` only ever looks at `[[known_gap]]` entries, so these two
-# can never trigger its "promote to [[expect]]" suggestion -- that
-# suggestion would have been wrong here: promoting either of these to
-# `[[expect]]` would assert code that is provably not vulnerable is a
-# defect. They were briefly filed as `[[known_gap]]` before this entry type
-# existed, which produced exactly that wrong suggestion every run; see
-# corpus_gate.rs's MAX_KNOWN_GAPS history comment for that correction.
+# The fourth -- a shell-injection sink inside a function nothing in this
+# file calls (reachability) -- used to be here too, at
+# vulnerable/real_misses/shell_command_via_unreachable_function.py.
+# flow.passthrough_downgrade turned that specific fixture's
+# shape (a bare pass-through of the unreachable function's own parameter)
+# into a correctly-handled case rather than a false positive: it is now an
+# `[[expect]]` entry with `kind = "observation"` below, not a
+# `known_false_positive` here. The general reachability gap is not fully
+# closed -- a command built from more than a bare parameter inside an
+# unreachable function still fires as a defect -- but no corpus fixture
+# currently demonstrates that narrower remaining case.
 # ---------------------------------------------------------------------
 
-[[known_false_positive]]
-file     = "vulnerable/real_misses/eval_guarded_by_local_check.py"
-line     = 65
+[[expect]]
+file     = "vulnerable/real_misses/shell_command_via_unreachable_function.py"
+line     = 23
+rule     = "BAS-LLM10-009"
 category = "LLM10"
-why      = "eval(class_name) where class_name can only ever be self.__class__.__name__ of a closed set of subclasses defined in this module -- not attacker-influenceable. The taint-safety proof lives at class_name's assignment one line above the call, which `none:` cannot see (it only matches alternate shapes of the eval() call node itself)."
+kind     = "observation"
+severity = "critical"
+why      = "subprocess.check_output(command, shell=True, ...) inside run_raw_command(), a function nothing in this corpus imports or calls. Promoted from known_false_positive: command is a bare pass-through of run_raw_command's own command parameter, run_raw_command is not itself a recognized entry point (@mcp.tool()/@app.route()/do_GET-style), and no entry point in this file calls it with an untrusted argument -- flow.passthrough_downgrade reports it as an observation instead of a defect. severity stays the rule's own declared severity (critical); only kind changes."
 
 [[known_false_positive]]
-file     = "vulnerable/real_misses/eval_guarded_by_local_check.py"
-line     = 81
+file     = "vulnerable/real_misses/shell_command_behind_disabled_flag.py"
+line     = 25
 category = "LLM10"
-why      = "eval(f\"torch.{torch_dtype}\") guarded one line above by an exact-match check against a 3-item whitelist that raises before eval() is ever reached. The guard is a sibling if/raise statement, not part of the eval() call's own node, so `none:` (same-node exclusion) and `inside:` (ancestor constraint) both structurally cannot express it."
+why      = "subprocess.run(command, shell=True, ...) reachable only when the module-level SECURE_MODE constant is False, which it never is in this file. BAS-LLM10-009 has no constant-propagation or dead-branch analysis, so it cannot prove the branch containing the sink is unreachable in the shipped version."
+
+[[known_false_positive]]
+file     = "vulnerable/real_misses/credential_default_echoed_as_client_credential.py"
+line     = 30
+category = "ZT1"
+why      = "(Low confidence -- borderline.) A credential-shaped os.environ.get() default sent as a client credential in a login request body, not compared against or stored. BAS-ZT1-020 cannot distinguish a client script echoing a server's own documented default account from a program defending its own weak default secret -- both are the identical os.environ.get(CREDENTIAL_KEY, \"real-looking-default\") shape, and only this file's own docstring says which one it is."
+
+[[known_false_positive]]
+file     = "vulnerable/real_misses/sql_ddl_via_local_variable.py"
+line     = 23
+category = "LLM10"
+why      = "ensure_column(): sql = f\"ALTER TABLE {table} ADD COLUMN {column} TEXT\"; conn.execute(sql) -- a genuine schema-identifier interpolation split across a local variable, the same DDL shape Finding 2 of the 2026-09-24 final review fixed for BAS-LLM10-017's same-node case. BAS-LLM10-018 matches the f-string's inner text as $$$FSTR, a variadic capture; a metavariable_not_matches clause mirroring -017's fix was tried and confirmed empirically to never exclude anything, because this engine's metavariable_not_matches only ever reads MetaVarEnv's single_matched map via env.get_match(), never multi_matched where a $$$-bound capture is stored -- the same limitation already documented for metavariable_matches against three_interpolation_override.py's $$$OVERRIDE capture. See bastyn.yml's comment on BAS-LLM10-018 for the full investigation."
 
 # ---------------------------------------------------------------------
 # vulnerable/zt3_container_boundary/ — the sandbox boundary, which is not
@@ -393,9 +749,9 @@ file     = "vulnerable/zt3_container_boundary/Dockerfile"
 line     = 14
 rule     = "BAS-INFRA-006"
 category = "ZT1"
-kind     = "defect"
-severity = "critical"
-why      = "ENV DB_PASSWORD=Sup3rWeakPass! is a hardcoded credential, not shaped like a provider key -- BAS-INFRA-002's `sk-`-shaped gate does not cover it, and the two rules must not double-report the same literal."
+kind     = "observation"
+severity = "high"
+why      = "ENV DB_PASSWORD=Sup3rWeakPass! is a hardcoded credential, not shaped like a provider key -- BAS-INFRA-002's `sk-`-shaped gate does not cover it, and the two rules must not double-report the same literal. Reported high, not critical: credential_severity() rates a value that is neither high-entropy nor named for a cloud provider as high."
 
 [[expect]]
 file     = "vulnerable/zt3_container_boundary/Dockerfile"
@@ -447,16 +803,16 @@ file     = "vulnerable/zt3_container_boundary/docker-compose.yml"
 line     = 11
 rule     = "BAS-INFRA-006"
 category = "ZT1"
-kind     = "defect"
-severity = "critical"
-why      = "MYSQL_PASSWORD=password in the list form of environment: is a real weak default -- verbatim shape from the head-to-head benchmark against a Python prototype, which caught this class and Bastyn originally missed it entirely."
+kind     = "observation"
+severity = "high"
+why      = "MYSQL_PASSWORD=password in the list form of environment: is a real weak default. Reported high, not critical: credential_severity() rates a value that is neither high-entropy nor named for a cloud provider as high."
 
 [[expect]]
 file     = "vulnerable/zt3_container_boundary/docker-compose.yml"
 line     = 12
 rule     = "BAS-INFRA-006"
 category = "ZT1"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "SERVICE_TOKEN=svc_4f8a1c62d90b47e3a5216fbc8de07394 -- a hardcoded token that does not match any vendor-specific key shape (BAS-ZT1-003's `sk-` gate), caught here because the generic check gates on the credential-shaped variable name, not the value's own shape."
 
@@ -465,9 +821,9 @@ file     = "vulnerable/zt3_container_boundary/docker-compose.yml"
 line     = 18
 rule     = "BAS-INFRA-006"
 category = "ZT1"
-kind     = "defect"
-severity = "critical"
-why      = "MYSQL_ROOT_PASSWORD: 'aa123456' in the mapping form of environment: -- format parity with the list-form findings above. MYSQL_DATABASE on the line below must not be flagged."
+kind     = "observation"
+severity = "high"
+why      = "MYSQL_ROOT_PASSWORD: 'aa123456' in the mapping form of environment: -- format parity with the list-form findings above. MYSQL_DATABASE on the line below must not be flagged. Reported high, not critical: credential_severity() rates a value that is neither high-entropy nor named for a cloud provider as high."
 
 # =====================================================================
 # mcp/ — MCP server configuration shapes
@@ -478,7 +834,7 @@ file     = "mcp/streamable_http/mcp.json"
 line     = 4
 rule     = "BAS-MCP-002"
 category = "ZT1"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
 why      = "The opsbot-metrics server is reached over plain http:// with no Authorization/token/key in headers or env."
 
@@ -496,6 +852,24 @@ severity = "high"
 why      = "The opsbot-logs stdio server is launched with root filesystem access (\"/\"); the opsbot-runbooks server in the same file, scoped to /srv/opsbot/runbooks, must not be flagged."
 
 [[expect]]
+file     = "mcp/stdio_two/mcp.json"
+line     = 5
+rule     = "BAS-MCP-005"
+category = "LLM04"
+kind     = "observation"
+severity = "high"
+why      = "The opsbot-logs server is launched from a package registry (npx -y / uvx) with no version pin, so what runs can change without a change to this repository."
+
+[[expect]]
+file     = "mcp/stdio_two/mcp.json"
+line     = 9
+rule     = "BAS-MCP-005"
+category = "LLM04"
+kind     = "observation"
+severity = "high"
+why      = "The opsbot-runbooks server is launched from a package registry (npx -y / uvx) with no version pin, so what runs can change without a change to this repository."
+
+[[expect]]
 file     = "mcp/stdio_two/mcp.yaml"
 line     = 6
 rule     = "BAS-MCP-001"
@@ -505,6 +879,24 @@ severity = "high"
 why      = "Same two-server config as mcp.json, in YAML: format parity. The reported line is the first line containing the literal offending arg text (\"/\"), which in YAML's layout is the preceding args entry, not the bare \"/\" line itself -- the documented approximate-location behaviour in mcp/checks.rs, confirmed by running the built scanner."
 
 [[expect]]
+file     = "mcp/stdio_two/mcp.yaml"
+line     = 6
+rule     = "BAS-MCP-005"
+category = "LLM04"
+kind     = "observation"
+severity = "high"
+why      = "The opsbot-logs server is launched from a package registry (npx -y / uvx) with no version pin, so what runs can change without a change to this repository."
+
+[[expect]]
+file     = "mcp/stdio_two/mcp.yaml"
+line     = 11
+rule     = "BAS-MCP-005"
+category = "LLM04"
+kind     = "observation"
+severity = "high"
+why      = "The opsbot-runbooks server is launched from a package registry (npx -y / uvx) with no version pin, so what runs can change without a change to this repository."
+
+[[expect]]
 file     = "mcp/stdio_two/mcp.toml"
 line     = 3
 rule     = "BAS-MCP-001"
@@ -512,6 +904,37 @@ category = "ZT3"
 kind     = "defect"
 severity = "high"
 why      = "Same two-server config as mcp.json, in TOML: format parity."
+
+[[expect]]
+file     = "mcp/stdio_two/mcp.toml"
+line     = 3
+rule     = "BAS-MCP-005"
+category = "LLM04"
+kind     = "observation"
+severity = "high"
+why      = "The opsbot-logs server is launched from a package registry (npx -y / uvx) with no version pin, so what runs can change without a change to this repository."
+
+[[expect]]
+file     = "mcp/stdio_two/mcp.toml"
+line     = 7
+rule     = "BAS-MCP-005"
+category = "LLM04"
+kind     = "observation"
+severity = "high"
+why      = "The opsbot-runbooks server is launched from a package registry (npx -y / uvx) with no version pin, so what runs can change without a change to this repository."
+
+[[expect]]
+file     = "mcp/url_secret/mcp.json"
+line     = 4
+rule     = "BAS-MCP-009"
+category = "ZT1"
+kind     = "defect"
+severity = "high"
+why      = "A literal api_key value sits in the query string of the server URL; the https scheme keeps BAS-MCP-002 quiet, so this is the only finding."
+
+[[expect_none]]
+file = "clean/mcp_launchers/mcp.json"
+why  = "URLs with an interpolated key, a short placeholder token and ordinary query parameters -- every shape BAS-MCP-009 must walk past. Later launcher near-misses are appended to this file."
 
 # =====================================================================
 # clean/ — same jobs, done safely. Every near-miss that fools naive rules.
@@ -524,6 +947,10 @@ why  = "os.environ subscript for the API key (not a string literal), a secret-na
 [[expect_none]]
 file = "clean/prompts.py"
 why  = "A prompt-named variable with no sk--shaped content, and untrusted input kept in its own ChatPromptTemplate slot rather than f-string-interpolated into instructions."
+
+[[expect_none]]
+file = "clean/user_role_prompt.py"
+why  = "The interpolated text is sent in the user role with fixed system instructions, and the second prompt interpolates a literal fixed in this file."
 
 [[expect_none]]
 file = "clean/tools.py"
@@ -539,7 +966,23 @@ why  = "A public, unauthenticated chat endpoint (correct for a public chatbot) w
 
 [[expect_none]]
 file = "clean/near_misses.py"
-why  = "eval on a literal, approx_tokens / token_count / api_key_name / max_tokens near-miss variable names, os.environ / os.getenv credential handling, a non-prompt-shaped f-string, and a parameterized SQL query -- the cases that fool naive rules. Plus three 2026-08-31 additions measured on real third-party repositories: a Bearer token that is unexpanded {{env.X}} template syntax, a credential scrubbed to [REDACTED] before being persisted, and a static audit query split across more adjacent literals than BAS-LLM10-003's old none: enumeration covered, one of which contains the column name completion_tokens."
+why  = "eval on a literal, approx_tokens / token_count / api_key_name / max_tokens near-miss variable names, os.environ / os.getenv credential handling, a non-prompt-shaped f-string, and a parameterized SQL query -- the cases that fool naive rules. Plus three 2026-08-31 additions measured on real third-party repositories: a Bearer token that is unexpanded {{env.X}} template syntax, a credential scrubbed to [REDACTED] before being persisted, and a static audit query split across more adjacent literals than BAS-LLM10-003's old none: enumeration covered, one of which contains the column name completion_tokens. Plus two 2026-09-24 additions proving BAS-LLM10-009's new exclude_if: closed_value clause: restart_worker_via_variable() (moved here from vulnerable/real_misses/shell_command_via_local_variable.py once the Tier-2 dataflow graph could resolve a literal held in a local variable back to the closed literal it holds) and restart_component() (a shell command looked up in a dict of literal commands after a membership check, provably one of the dict's own values regardless of the identifier's name). Plus a third 2026-09-24 addition proving the widened exclude_if: [closed_value, shell_quoted] clause: run_playbook_fully_quoted(), where every interpolated segment of the shell command is wrapped in shlex.quote(), safe as shell input regardless of content -- see vulnerable/llm10_shell_injection_tool.py's run_playbook_partially_quoted() for the must-still-fire sibling with one unquoted segment. Plus a fourth 2026-09-24 addition proving BAS-LLM10-012's new exclude_if: constant_path clause: read_bundled_config() (moved here from vulnerable/real_misses/path_traversal_safe_local_constant.py once the Tier-2 dataflow graph could resolve HERE, a module-level constant built from os.path.dirname(__file__), back to a provable constant_path) -- see vulnerable/llm10_path_traversal_tool.py's read_bundled_asset() for the must-still-fire sibling where the same os.path.join(root, filename) shape uses a bare function parameter instead of a __file__-derived module constant."
+
+[[expect_none]]
+file = "clean/literal_sinks.py"
+why  = "SQL, a shell command and eval() whose argument is a literal fixed in this file, including under the variable names a model reply is often given. Nothing from outside the file reaches them."
+
+[[expect_none]]
+file = "clean/eval_calculator_charclass.py"
+why  = "eval() on a value that a full match, a filtering substitution or an isdigit() check has limited to digits, whitespace, parentheses and arithmetic operators, which cannot spell a name, attribute or call."
+
+[[expect_none]]
+file = "clean/eval_allowlisted.py"
+why  = "eval() on a parameter that a preceding `not in` check against fixed literals has already limited to two harmless expressions."
+
+[[expect_none]]
+file = "clean/shadowed_eval.py"
+why  = "eval here is a function this file defines, not the Python builtin, so passing a model reply to it executes nothing."
 
 [[expect_none]]
 file = "clean/mcp/mcp.json"
@@ -552,6 +995,57 @@ why  = "A multi-stage build whose builder stage runs USER root and whose shipped
 [[expect_none]]
 file = "clean/docker-compose.yml"
 why  = "privileged: false, network_mode: bridge, a project-relative bind mount and a named volume -- every shape BAS-INFRA-003/004/005 must walk past. Plus every BAS-INFRA-006 near-miss: an interpolated MYSQL_PASSWORD, a credentials-file path on GOOGLE_APPLICATION_CREDENTIALS, a boolean flag on MYSQL_ALLOW_EMPTY_PASSWORD, an empty MYSQL_PASSWORD, and a documented placeholder on MYSQL_ROOT_PASSWORD."
+
+[[expect_none]]
+file = "clean/stdin_dispatch_hook.py"
+why = "command traces to an unprocessed sys.stdin read (json.load(sys.stdin)) -- the hook/skill-runner dispatch shape, excluded via exclude_if: stdin_dispatch."
+
+[[expect_none]]
+file = "clean/cli_argument_paths.py"
+why = "Every value traces entirely to the operator's own command line, excluded via exclude_if: cli_argument on BAS-LLM10-009/BAS-LLM10-012. main() joins argparse's --eval-dir into an open() path (args.eval_dir, from a genuine argparse.ArgumentParser().parse_args() call) and interpolates sys.argv[1] into a shell command. cli() and run() exercise the click/typer command-parameter source shape in isolation: a @click.command()/@click.option(...)-decorated function and an @app.command()-decorated function (app = typer.Typer()) whose own parameter reaches subprocess.run(..., shell=True)."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_via_request_parser.py"
+line     = 24
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run(): args comes from reqparse.RequestParser().parse_args() -- a Flask-RESTful/flask-restx HTTP request parser, not argparse.ArgumentParser. exclude_if: cli_argument requires the parse_args()/parse_known_args() receiver to actually resolve to a call to argparse.ArgumentParser(...), so a same-named method on an unrelated request-parsing class must not be trusted the same way."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_injection_via_request_parser.py"
+line     = 25
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "run(): same reasoning as the BAS-LLM10-009 finding on the line above, for the file path this rule inspects rather than the shell command -- args[\"file\"] is HTTP request data, not the operator's own command line."
+
+[[expect_none]]
+file = "clean/module_constant_path_join.py"
+why = "DATA_DIR is a module-level literal assignment; constant_path already traces a Name node through a module-scope binding to its own literal via the existing lookup/decide mechanism in flow/graph.rs, so this case is correctly excluded without any code change. Added as a regression-locking fixture."
+
+[[expect_none]]
+file = "clean/pathlib_constant_root.py"
+why = "constant_path understands pathlib as well as os.path. HERE and ASSETS both trace back to __file__ through Path(__file__), .parent, the / operator, .resolve(), .parents[...] (a subscript, which already passes constant_path through unchanged like any other attribute read), and str() -- every one of them either already generic (attribute/subscript/binary_operator resolution) or explicitly whitelisted (PATH_CONST_FUNCTIONS' Path/str entries, PATHLIB_ZERO_ARG_METHODS' resolve). load_overlay's f-string and load_readme's + concatenation both already fold constant_path across their parts once the root itself resolves correctly, so no separate string-shape handling was needed."
+
+[[expect_none]]
+file = "clean/tempdir_shell.py"
+why = "a value traced to tempfile is an OS-generated temp path when called with no arguments or only already-safe arguments, never attacker-influenced, so it reads as both closed (BAS-LLM10-009's exclude_if: closed_value) and constant_path (BAS-LLM10-012's exclude_if: constant_path) via the TEMPFILE_CLOSED_CALLEES whitelist. sync_repo() proves the with tempfile.TemporaryDirectory() as tmpdir: / workspace = Path(tmpdir) shape: tmpdir is closed via the as-target binding resolving through TemporaryDirectory()'s own call Resolved, and workspace is closed too because Path(...) now propagates .closed across its arguments the same way it already propagated .constant_path (the two facts are otherwise computed independently for a call node) -- without that propagation, os.system(f\"cd {workspace} && ...\") would still fire even though the path is provably safe. collect_diagnostics() proves the same two exclusions on a bare tempfile.mkdtemp() value with no Path(...)/as-pattern wrapping at all. See vulnerable/llm10_shell_injection_tool.py's unpack() for the must-still-fire sibling that mixes a tempfile value with a real caller-supplied parameter."
+
+# clean/dotenv_example/.env.example carries no [[expect_none]] entry here for
+# the same reachability reason documented next to vulnerable/dotenv_leak/.env
+# above: it is nested two levels below this gate's single tests/corpus scan
+# root, past walk.rs's root-only .env allowlist, so this gate never walks it
+# either way. Its placeholder-suffix silence is covered by
+# crates/bastyn-core/src/dotenv.rs's own unit tests and by
+# crates/bastyn-core/src/scan.rs's dot_env_example_is_scanned_but_never_
+# flagged test, both scanning a tree with .env.example genuinely at the root.
+# clean/dotenv_multi_segment_example/.env.local.example and
+# clean/dotenv_placeholder_value/.env are the same shape of fixture, for the
+# same reason -- see the longer comment next to vulnerable/dotenv_leak/.env
+# above for what false-positive report they reproduce.
 
 # ---------------------------------------------------------------------
 # Shapes measured on a real application that the corpus did not originally
@@ -575,7 +1069,7 @@ file     = "vulnerable/zt3_isolation/mcp.json"
 line     = 5
 rule     = "BAS-MCP-005"
 category = "LLM04"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
 why      = "An MCP server launched via npx with no version pin resolves to whatever the registry serves at run time, inside the agent's trust boundary."
 
@@ -622,18 +1116,18 @@ file     = "vulnerable/llm03_excessive_agency.js"
 line     = 22
 rule     = "BAS-LLM03-002"
 category = "LLM03"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "shutdownServer, a destructive tool registered via the Vercel AI SDK's tool(), has no confirmation guard in its execute() before calling infraClient.shutdown(). Promoted from known_gap on 2026-08-28: BAS-LLM03-002 used to require a `name:` property inside tool({...}), which that SDK's helper does not have -- the tool's name is the binding it is assigned to, which is what the rule now reads."
+why      = "shutdownServer, a destructive tool registered via the Vercel AI SDK's tool(), has no confirmation guard in its execute() before calling infraClient.shutdown(). Promoted from known_gap on 2026-08-28: BAS-LLM03-002 used to require a `name:` property inside tool({...}), which that SDK's helper does not have -- the tool's name is the binding it is assigned to, which is what the rule now reads. Reported as an observation: the tool's name is the only evidence it changes state."
 
 [[expect]]
 file     = "vulnerable/llm03_excessive_agency.js"
 line     = 49
 rule     = "BAS-LLM03-002"
 category = "LLM03"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "updateServerConfig is a state-changing tool with no confirmation guard, not named with a delete/drop/... verb -- the JS/TS twin of the same gap the head-to-head benchmark exposed on the Python side."
+why      = "updateServerConfig is a state-changing tool with no confirmation guard, not named with a delete/drop/... verb. Reported as an observation: the tool's name is the only evidence it changes state."
 
 [[known_gap]]
 file     = "vulnerable/llm03_excessive_agency.js"
@@ -701,9 +1195,9 @@ file     = "vulnerable/llm10_eval_on_model_reply.ts"
 line     = 41
 rule     = "BAS-LLM10-005"
 category = "LLM10"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "runSuggestedExpression() passes the model's own reply straight to eval(), through a local variable named suggestion rather than response/reply/completion/...-shaped. Promoted from known_gap on 2026-08-28: BAS-LLM10-005 no longer gates on the argument's name, only on it not being a literal, so the naming that used to defeat it no longer does. Reported by the JavaScript rule rather than a TypeScript twin, because JS rules now compile against the TypeScript grammar too -- the twin was a byte-identical duplicate and was deleted."
+why      = "runSuggestedExpression() passes the model's own reply straight to eval(), through a local variable named suggestion rather than response/reply/completion/...-shaped. Promoted from known_gap on 2026-08-28: BAS-LLM10-005 no longer gates on the argument's name, only on it not being a literal, so the naming that used to defeat it no longer does. Reported by the JavaScript rule rather than a TypeScript twin, because JS rules now compile against the TypeScript grammar too -- the twin was a byte-identical duplicate and was deleted. Reported as an observation: TypeScript/JavaScript has no dataflow graph to prove the value's origin."
 
 [[known_gap]]
 file     = "vulnerable/llm10_eval_on_model_reply.ts"
@@ -716,9 +1210,9 @@ file     = "vulnerable/llm10_eval_on_model_reply.ts"
 line     = 65
 rule     = "BAS-LLM10-006"
 category = "LLM10"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
-why      = "executeSuggestedShellCommandSync() runs the model's reply through cp.execSync(), child_process imported under the cp namespace alias. Proves BAS-LLM10-006 still catches real receiver-qualified child_process usage after its receiver gate was narrowed away from any object with an .exec/.execSync method (see clean/near_misses.ts for the false positives that narrowing fixes)."
+why      = "executeSuggestedShellCommandSync() runs the model's reply through cp.execSync(), child_process imported under the cp namespace alias. Proves BAS-LLM10-006 still catches real receiver-qualified child_process usage after its receiver gate was narrowed away from any object with an .exec/.execSync method (see clean/near_misses.ts for the false positives that narrowing fixes). Reported as an observation: TypeScript/JavaScript has no dataflow graph to prove the value's origin."
 
 [[known_gap]]
 file     = "vulnerable/llm10_eval_on_model_reply.ts"
@@ -731,16 +1225,25 @@ file     = "vulnerable/zt1_static_credentials.ts"
 line     = 14
 rule     = "BAS-ZT1-003"
 category = "ZT1"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "OPENAI_API_KEY is a real-looking sk-proj-... key committed as an exported const literal instead of read from process.env or a secret manager."
+
+[[expect]]
+file     = "vulnerable/zt1_static_credentials.ts"
+line     = 14
+rule     = "BAS-ZT1-011"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "The generic credential-shaped-literal rule reports the exported const statement (column 8), alongside BAS-ZT1-003's report of the string itself (column 31). Both describe the same committed key."
 
 [[expect]]
 file     = "vulnerable/zt2_wildcard_tool_grant.ts"
 line     = 30
 rule     = "BAS-ZT2-002"
 category = "ZT2"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
 why      = "buildOpsbotAgent() calls selectToolsForAgent(ALL_TOOLS, \"*\") -- OpsBot's own internal tool-scoping layer -- with the wildcard grant, positionally rather than as a named allowedTools= keyword argument, which is the ordinary call shape in TS/JS and a further structural difference from the Python rule's named-kwarg pattern. Promoted from known_gap on 2026-08-28: BAS-ZT2-002 gates on the called function's own name (tool|agent-shaped) rather than the grant value's name, which is what let it close this gap without the false-positive blowup an ungated `$FN($$$PRE, \"*\")` produced across 65 real repositories (CORS headers, glob patterns, route wildcards)."
 
@@ -749,9 +1252,9 @@ file     = "vulnerable/zt4_no_delimiter.ts"
 line     = 16
 rule     = "BAS-ZT4-003"
 category = "ZT4"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "buildReplyPrompt() concatenates the customer's raw, fully untrusted ticket text (customerMessage) directly into the persona instructions template literal, no delimiter or separate message role. Caught by the JavaScript rule once JS rules began reaching .ts files -- the rule was always correct, it simply never ran here."
+why      = "buildReplyPrompt() concatenates the customer's raw, fully untrusted ticket text (customerMessage) directly into the persona instructions template literal, no delimiter or separate message role. Caught by the JavaScript rule once JS rules began reaching .ts files -- the rule was always correct, it simply never ran here. Reported as an observation: TypeScript/JavaScript has no dataflow graph to prove the value's origin."
 
 # ---------------------------------------------------------------------
 # clean/ -- OpsBot's Node service, done safely, plus TS/JS near-misses.
@@ -790,38 +1293,862 @@ file     = "vulnerable/skills/log-analyzer/SKILL.md"
 line     = 20
 rule     = "BAS-SKILL-002"
 category = "LLM01"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "Complete, well-formed frontmatter (name/description/version/permissions all present), but the body's \"example log line\" embeds classic instruction-override phrasing (\"ignore all previous instructions\") plus a sensitive-path reference (~/.ssh/id_rsa) disguised as sample input a log parser would encounter. Proves BAS-SKILL-002 fires on body text even when BAS-SKILL-001 has nothing to say about this file."
-
-[[expect]]
-file     = "vulnerable/skills/auto-remediate/SKILL.md"
-line     = 1
-rule     = "BAS-SKILL-001"
-category = "LLM04"
-kind     = "defect"
-severity = "low"
-why      = "Frontmatter declares only name and description, omitting version and permissions -- the two fields a host would need to pin this skill across updates or scope what it may do."
 
 [[expect]]
 file     = "vulnerable/skills/auto-remediate/SKILL.md"
 line     = 12
 rule     = "BAS-SKILL-003"
 category = "LLM03"
-kind     = "defect"
+kind     = "observation"
 severity = "high"
-why      = "The body states the skill \"will act autonomously\" and applies remediation \"rather than waiting on a human to approve each step\" -- explicit excessive-agency language telling the agent not to pause for approval before a chain of infrastructure-changing actions. Same file as the BAS-SKILL-001 finding above, proving one SKILL.md can trigger both an independent frontmatter check and an independent body-text check."
+why      = "The body states the skill \"will act autonomously\" and applies remediation \"rather than waiting on a human to approve each step\" -- explicit excessive-agency language telling the agent not to pause for approval before a chain of infrastructure-changing actions."
 
 [[expect_none]]
 file = "clean/skills/well-formed/SKILL.md"
-why  = "Complete frontmatter (name/description/version/permissions all present) and ordinary body text with no instruction-override or confirmation-skipping phrasing from either BAS-SKILL-002's or BAS-SKILL-003's list -- must produce zero findings."
+why  = "Frontmatter satisfies the two required fields (name, description) and additionally declares version and permissions, and the body has ordinary text with no instruction-override or confirmation-skipping phrasing from either BAS-SKILL-002's or BAS-SKILL-003's list -- must produce zero findings."
 
 [[expect]]
 file     = "vulnerable/skills/word-wrapped-injection/SKILL.md"
 line     = 11
 rule     = "BAS-SKILL-002"
 category = "LLM01"
-kind     = "defect"
+kind     = "observation"
 severity = "critical"
 why      = "Complete, well-formed frontmatter, but the body's classic instruction-override phrase (\"ignore all previous instructions\") is word-wrapped across a Markdown line break (\"IGNORE ALL PREVIOUS\\nINSTRUCTIONS\"). Regression fixture for a bug where scan_phrases only did a literal substring match and silently missed phrases split by a line break; the same phrasing on one line was already caught (see log-analyzer above)."
 
+[[expect]]
+file     = "vulnerable/zt1_secret_shapes.py"
+line     = 13
+rule     = "BAS-ZT1-018"
+category = "ZT1"
+kind     = "defect"
+severity = "critical"
+why      = "a live-looking JWT is hardcoded directly in source."
+
+[[expect]]
+file     = "vulnerable/zt1_secret_shapes.py"
+line     = 21
+rule     = "BAS-ZT1-019"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "an AWS access key ID in the exact AKIA-prefixed shape is hardcoded."
+
+[[expect]]
+file     = "vulnerable/zt1_secret_shapes.py"
+line     = 26
+rule     = "BAS-ZT1-020"
+category = "ZT1"
+kind     = "observation"
+severity = "high"
+why      = "the admin password's environment lookup has a real, source-visible default."
+
+# ---------------------------------------------------------------------
+# vulnerable/zt1_single_quoted_secrets.py -- final fix wave regression
+# (2026-09-25): BAS-ZT1-018/019's `any:` list was only '"$VALUE"'
+# (double-quoted), so the identical JWT/AWS-key literal spelled with
+# single quotes instead produced no finding at all.
+# ---------------------------------------------------------------------
+
+[[expect]]
+file     = "vulnerable/zt1_single_quoted_secrets.py"
+line     = 12
+rule     = "BAS-ZT1-018"
+category = "ZT1"
+kind     = "defect"
+severity = "critical"
+why      = "a live-looking JWT is hardcoded directly in source, single-quoted."
+
+[[expect]]
+file     = "vulnerable/zt1_single_quoted_secrets.py"
+line     = 20
+rule     = "BAS-ZT1-019"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "a real-looking AWS access key ID in the exact AKIA-prefixed shape, single-quoted."
+
+[[expect_none]]
+file = "clean/zt1_aws_example_key.py"
+why  = "AKIAIOSFODNN7EXAMPLE is AWS's own official published placeholder access key ID, excluded by name from BAS-ZT1-019 -- not a real credential."
+
+# ---------------------------------------------------------------------
+# vulnerable/zt1_jwt_credential_shaped_key.py -- a final-review regression
+# fixture (2026-09-23, finding I2). zt1_secret_shapes.py's JWT-holding key
+# was renamed from the realistic `service_token` to `issued_jwt`
+# specifically to avoid this co-firing; this file documents it instead as
+# intentional, correct behavior: a realistically-named credential-shaped
+# variable whose value also has the exact JWT shape legitimately produces
+# two independent, correct findings at the same line.
+# ---------------------------------------------------------------------
+
+[[expect]]
+file     = "vulnerable/zt1_jwt_credential_shaped_key.py"
+line     = 26
+rule     = "BAS-ZT1-010"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "session_token is a realistic, credential-shaped variable name holding a high-entropy literal -- BAS-ZT1-010's generic credential-shaped-key signal, independent of the value's specific shape."
+
+[[expect]]
+file     = "vulnerable/zt1_jwt_credential_shaped_key.py"
+line     = 26
+rule     = "BAS-ZT1-018"
+category = "ZT1"
+kind     = "defect"
+severity = "critical"
+why      = "the same literal also has the exact eyJ.<payload>.<signature> JWT shape -- BAS-ZT1-018's more specific signal, co-firing at the same line as BAS-ZT1-010 above. Both are correct, independent true positives, not a duplicate: one flags the name, the other flags the value's own structure."
+
+[[expect]]
+file     = "vulnerable/llm01_tool_poisoning.py"
+line     = 11
+rule     = "BAS-LLM01-002"
+category = "LLM01"
+kind     = "defect"
+severity = "high"
+why      = "the docstring contains an <IMPORTANT> tag instructing the model to read an SSH key and not mention doing so."
+
+[[expect]]
+file     = "vulnerable/llm01_tool_poisoning.py"
+line     = 22
+rule     = "BAS-LLM01-003"
+category = "LLM01"
+kind     = "observation"
+severity = "low"
+why      = "the docstring contains \"ignore previous instructions\" phrasing, a lower-confidence lexical signal."
+
+# =====================================================================
+# observations/ -- name-gated JS/TS shapes with no dataflow graph to prove
+# a literal's origin, so each finding below is a kind = "observation".
+# =====================================================================
+
+[[expect]]
+file     = "observations/literal_sinks.ts"
+line     = 4
+rule     = "BAS-LLM10-006"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "A literal shell command. TypeScript has no dataflow graph here, so the engine cannot prove the argument fixed and reports an observation, never a defect."
+
+[[expect]]
+file     = "observations/literal_sinks.ts"
+line     = 7
+rule     = "BAS-LLM10-005"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "eval() on a literal held in a const. Observation for the same reason as line 4."
+
+# =====================================================================
+# flow.passthrough_downgrade (BAS-LLM10-009). observations/
+# shell_passthrough_helpers.py proves the downgrade; vulnerable/
+# llm10_shell_passthrough_still_defect.py proves each of its four
+# conditions individually keeps a lookalike shape a defect. See
+# bastyn.yml's comment on BAS-LLM10-009 and
+# crate::flow::graph::FlowGraph::is_passthrough_observation_eligible.
+# =====================================================================
+
+[[expect]]
+file     = "observations/shell_passthrough_helpers.py"
+line     = 18
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "run_shell_cmd(cmd): cmd is a bare pass-through of run_shell_cmd's own parameter, run_shell_cmd is not a recognized entry point, and nothing in this file forwards an entry point's own parameter into it -- all four flow.passthrough_downgrade conditions hold, so this is reported as an observation rather than a defect."
+
+[[expect]]
+file     = "observations/shell_passthrough_helpers.py"
+line     = 30
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "observation"
+severity = "critical"
+why      = "HookExecutor.execute(): command is one plain local alias of hook.command, itself this method's own parameter -- 'pure pass-through' follows exactly one plain local alias between a parameter and the sink, so this is reported as an observation rather than a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 28
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "execute_command(): command is a bare pass-through, but execute_command is itself decorated @mcp.tool() -- a recognized entry point -- so flow.passthrough_downgrade's condition 2 fails and this stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 35
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "_exec(): cmd is a bare pass-through and _exec is not itself an entry point, but the @mcp.tool()-decorated run() below forwards its own cmd parameter into _exec(cmd) -- flow.passthrough_downgrade's condition 3 (no entry point forwards its own parameter into this helper) fails, so this stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 48
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "apply_manifest(): manifest traces to json.load(open(path)), a file_read source, not a bare parameter of apply_manifest -- flow.passthrough_downgrade's condition 1 (ARG's Origin is exactly Origin::Parameter) fails outright, so this stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 54
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "ping(): the command is an f-string composed around host, not host itself -- not a syntactically bare identifier/attribute/subscript, so flow.passthrough_downgrade's condition 1 fails and this stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 66
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "ping_reassigned(): host is reassigned to a composed f-string using its own name before reaching the sink. The reassignment is itself a binding of `host`, so is_provably_bare_passthrough's zero-bindings rule for a parameter root disqualifies it, the same as any other reassigned name would be."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 80
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_branch_alias(): cmd is bound once in each arm of an if/else, one arm composed, the other a bare pass-through. A second binding of the name anywhere in the function -- regardless of which branch -- disqualifies it, since this file-local syntactic check cannot prove which arm's binding reaches the sink."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 90
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_for_loop_alias(): cmd is bound by a for-loop target, not a plain assignment -- is_provably_bare_passthrough only ever follows a plain assignment as its one permitted local-alias hop, so a for-loop target disqualifies the name."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 105
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "HandlerA.do_GET(): two unrelated BaseHTTPRequestHandler subclasses each define their own do_GET. Entry-point status is decided directly from each function's own node, never from a name-keyed map that could drop an ambiguously-defined name, so this do_GET is independently, correctly recognized as an entry point despite HandlerB below sharing its method name."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 114
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "HandlerB.do_GET(): the second do_GET sharing HandlerA's method name above -- both are independently recognized as entry points, so neither is wrongly downgraded."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 129
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "Runner.go(): self.cmd was set in __init__ from run_tool()'s own @mcp.tool()-decorated parameter, but this file-local analysis cannot trace an attribute write in one method to a read in another. self/cls never qualify as a bare-parameter root, so self.cmd stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 148
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "QualifiedForward._exec(): _exec's own cmd is a bare pass-through, but run() -- an @mcp.tool()-decorated entry-point method -- forwards its own cmd parameter into _exec via a qualified self._exec(cmd) call. collect_entry_point_forwards recognizes self.NAME(...)/cls.NAME(...) qualified calls, not just a bare NAME(...) call, so this stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 162
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_attribute_mutated(): hook.command is reassigned in place (hook.command = f\"sh -c {hook.command}\") before reaching the sink. path_is_reassigned finds the exact-text-matching assignment target and disqualifies the whole attribute path, regardless of how bare hook.command looks at the sink call itself."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 171
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_subscript_mutated(): opts[\"cmd\"] is reassigned in place before reaching the sink -- same reasoning as run_attribute_mutated() above, for a subscript path instead of an attribute path."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 182
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_comprehension_target(): the list comprehension's own for cmd in [...] target shadows the outer parameter. occurrences_of's read-whitelist does not recognize a comprehension's for_in_clause target as a safe read, so it classifies as Occurrence::Other and disqualifies cmd outright."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 194
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_match_case_capture(): case [cmd]: captures a new binding of cmd from the match subject, shadowing the outer parameter -- the same unrecognized-construct-disqualifies reasoning as run_comprehension_target() above, for a match/case capture instead of a comprehension target."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 210
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_nonlocal_write(): a nested function declares cmd nonlocal and reassigns it to a composed value. is_declared_nonlocal_or_global disqualifies cmd unconditionally the moment any nonlocal/global declaration names it anywhere in the function."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 223
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_all(): the lambda's own cmd parameter shadows run_all's cmd. is_passthrough_observation_eligible finds its enclosing scope by walking up to the nearest SCOPE_KINDS ancestor (function_definition OR lambda), not just the nearest function_definition, so it correctly stops at the lambda -- which, having no name, is never eligible for the downgrade at all."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 229
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_lambda_default_capture(): the same lambda-scope-boundary shape as run_all() above, via a default-argument capture instead of map()."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 236
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_lambda_immediately_invoked(): the same lambda-scope-boundary shape as run_all() above, immediately invoked rather than stored or mapped."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 250
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_with_parenthesized_target(): `as (cmd)` parses `(cmd)` as a parenthesized_expression wrapping the bound name, a binding context, not a read -- classify_occurrence climbs through a chain of wrapper-kind ancestors before deciding, instead of accepting a parenthesized_expression parent unconditionally as a safe read."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 265
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "_exec_request_cmd(): cmd is a bare pass-through of this function's own parameter, but run_route() (a Flask route, an entry point) calls it with request.args[\"cmd\"] -- a value read from the global request object, not from any of run_route's own parameters. An entry point that calls a local function with an argument this graph cannot prove is safe disqualifies that callee from the downgrade, regardless of whether the argument traces to the entry point's own parameter list."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 278
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "_exec_model_output(): same reasoning as _exec_request_cmd() above, but the argument reaching this helper from run_model_output() is a local variable holding a model reply, not a value read from a request global."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 294
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_django_view(): request.GET[\"cmd\"] is two levels of attribute/subscript access on the parameter request (an attribute, .GET, then a subscript on that result). A bare pass-through is bounded to exactly one level of attribute or subscript on the root parameter, matching the specification's own p / p.attr / p[\"key\"] condition literally, so this two-level shape stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_passthrough_still_defect.py"
+line     = 303
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "run_non_literal_subscript_key(): opts[key] has a non-literal subscript key -- key is itself a variable, not a fixed value written in this file. A bare pass-through's subscript key must itself be a literal, matching the specification's p[\"key\"] wording, so a variable key stays a defect."
+
+# ---------------------------------------------------------------------
+# Known, bounded limitations of collect_entry_point_forwards, documented
+# rather than fixed -- see bastyn.yml's comment on BAS-LLM10-009.
+# ---------------------------------------------------------------------
+
+[[known_gap]]
+file     = "vulnerable/real_misses/shell_command_via_chained_tool_forward.py"
+line     = 25
+category = "LLM10"
+why      = "_inner()'s cmd is forwarded from run() (an @mcp.tool() entry point) through _outer() -- two hops, not the one hop collect_entry_point_forwards checks for. flow.passthrough_downgrade wrongly reports this as an observation instead of a defect. The same bounded-depth precedent FlowGraph::wrapper_sink_parameters's own doc comment already accepts for the sink side (\"a wrapper around a wrapper is out of reach by construction, not merely untested\") applies here on the entry-point-forwarding side; extending it to arbitrary-depth call chains is out of this check's scope."
+
+[[known_gap]]
+file     = "vulnerable/real_misses/shell_command_via_thread_pool_forward.py"
+line     = 26
+category = "LLM10"
+why      = "_exec()'s cmd is forwarded from run() (an @mcp.tool() entry point) through asyncio.to_thread(_exec, cmd) -- a callee shape collect_entry_point_forwards does not recognize (only a bare NAME(...) call or a self/cls-qualified NAME(...) call are). flow.passthrough_downgrade wrongly reports this as an observation instead of a defect. The space of ways Python code can pass a callable and its argument along (thread pools, unbound-method calls, super() calls, decorator registries, dict-of-callables dispatch, ...) is genuinely open-ended; this is one representative shape, not exhaustive -- see bastyn.yml's comment for the others, which fail identically for the identical reason."
+
+# ---------------------------------------------------------------------
+# Credential-shaped names holding URLs: a plain http(s) URL with no
+# embedded user:password is not a secret; one with credentials still is.
+# ---------------------------------------------------------------------
+
+[[expect_none]]
+file = "clean/zt1_url_values.py"
+why  = "credential-shaped names holding plain endpoint URLs with no embedded credentials"
+
+[[expect]]
+file     = "vulnerable/zt1_url_with_credentials.py"
+line     = 3
+rule     = "BAS-ZT1-010"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "a URL whose userinfo part is a credential is a hardcoded secret"
+
+[[expect]]
+file     = "vulnerable/zt1_url_with_credentials.py"
+line     = 4
+rule     = "BAS-ZT1-010"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "a URL whose query string carries a credential is a hardcoded secret"
+
+[[expect_none]]
+file = "clean/zt1_dummy_fixture_keys.ts"
+why  = "provider-key-shaped literals whose text says they are dummy secrets that must not leak"
+
+[[expect_none]]
+file = "clean/zt1_cookie_names.ts"
+why  = "credential-shaped constant names holding reserved-prefix cookie names"
+
+[[expect]]
+file     = "vulnerable/zt1_passphrase_password.ts"
+line     = 1
+rule     = "BAS-ZT1-011"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "a passphrase-shaped literal assigned to a password is a hardcoded secret"
+
+[[expect]]
+file     = "mcp/shell_wrapper/mcp.json"
+line     = 5
+rule     = "BAS-MCP-001"
+category = "ZT3"
+kind     = "defect"
+severity = "high"
+why      = "npx -y @scope/server / is hidden behind bash -c; the root argument is only visible once the script is read. The reported line is the first line containing the literal \"/\" (documented approximate-location behaviour), which is this args line."
+
+[[expect]]
+file     = "mcp/shell_wrapper/mcp.json"
+line     = 5
+rule     = "BAS-MCP-005"
+category = "LLM04"
+kind     = "observation"
+severity = "high"
+why      = "The same inner npx launch has no version pin."
+
+[[expect]]
+file     = "mcp/shell_wrapper/mcp.json"
+line     = 9
+rule     = "BAS-MCP-006"
+category = "LLM04"
+kind     = "defect"
+severity = "high"
+why      = "curl ... | sh inside sh -c: code fetched at launch and run with no pin."
+
+[[expect]]
+file     = "mcp/docker_launchers/mcp.json"
+line     = 5
+rule     = "BAS-MCP-007"
+category = "ZT3"
+kind     = "defect"
+severity = "high"
+why      = "The Docker socket is bind-mounted into the server's container: full control of the daemon."
+
+[[expect]]
+file     = "mcp/docker_launchers/mcp.json"
+line     = 9
+rule     = "BAS-MCP-001"
+category = "ZT3"
+kind     = "defect"
+severity = "high"
+why      = "The root bind mount \"/:/host\" in the rootmount server, reported on that server's own args line."
+
+[[expect]]
+file     = "mcp/docker_launchers/mcp.json"
+line     = 13
+rule     = "BAS-MCP-007"
+category = "ZT3"
+kind     = "defect"
+severity = "high"
+why      = "podman run --privileged."
+
+[[expect]]
+file     = "mcp/docker_launchers/mcp.json"
+line     = 17
+rule     = "BAS-MCP-008"
+category = "ZT3"
+kind     = "observation"
+severity = "medium"
+why      = "docker run --network host. Host networking is a legitimate sidecar pattern, so an observation."
+
+# =====================================================================
+# HTTP MCP servers that bind all interfaces (BAS-ZT3-001, BAS-ZT3-002).
+# =====================================================================
+
+[[expect]]
+file     = "observations/mcp_http_bind_all.py"
+line     = 3
+rule     = "BAS-ZT3-001"
+category = "ZT3"
+kind     = "observation"
+severity = "medium"
+why      = "FastMCP bound to 0.0.0.0 in a file that serves streamable-http and shows no AuthSettings or token verifier."
+
+[[expect]]
+file     = "observations/mcp_http_bind_all.ts"
+line     = 15
+rule     = "BAS-ZT3-002"
+category = "ZT3"
+kind     = "observation"
+severity = "medium"
+why      = "app.listen on 0.0.0.0 in a file that builds StreamableHTTPServerTransport and shows no bearer-auth middleware."
+
+[[expect_none]]
+file = "clean/mcp_http_local.py"
+why  = "The same server bound to 127.0.0.1 -- loopback exposes nothing to the network."
+
+[[expect_none]]
+file = "clean/mcp_http_auth.py"
+why  = "Bind-all, but the server is built with an auth= argument in the same file, so the exposure is authenticated."
+
+[[expect_none]]
+file = "clean/mcp_http_auth.ts"
+why  = "Bind-all, but requireBearerAuth is present in the file, so the exposure is authenticated."
+
+[[expect_none]]
+file = "clean/plain_express_bind_all.ts"
+why  = "Listening on 0.0.0.0 with no MCP transport in the file -- an ordinary web service, not this rule's subject."
+
+[[expect_none]]
+file = "clean/mcp_stdio_server.py"
+why  = "A stdio MCP server: no network listener at all."
+
+# ---------------------------------------------------------------------
+# LLM04: a package-manager install started as a child process.
+# ---------------------------------------------------------------------
+
+[[expect]]
+file     = "vulnerable/llm04_runtime_package_install.js"
+line     = 5
+rule     = "BAS-LLM04-002"
+category = "LLM04"
+kind     = "observation"
+severity = "low"
+why      = "spawnSync runs npm install while the code runs"
+
+[[expect]]
+file     = "vulnerable/llm04_runtime_package_install.js"
+line     = 9
+rule     = "BAS-LLM04-002"
+category = "LLM04"
+kind     = "observation"
+severity = "low"
+why      = "execSync runs pnpm add while the code runs"
+
+[[expect_none]]
+file = "clean/llm04_runtime_install_near_misses.js"
+why  = "npm run and npm ci spawns, npm test, git add, require(\"npm\"), and install only inside strings and comments"
+
+# =====================================================================
+# mcp/tools_snapshot/ — a tools snapshot written by `bastyn inspect-server`
+# =====================================================================
+
+[[expect]]
+file     = "mcp/tools_snapshot/notes.bastyn-tools.json"
+line     = 5
+rule     = "BAS-MCP-011"
+category = "LLM01"
+kind     = "defect"
+severity = "high"
+why      = "The add tool's description carries an <IMPORTANT> marker and an instruction not to tell the user, text the model reads and a person skimming the tool list does not."
+
+[[expect]]
+file     = "mcp/tools_snapshot/notes.bastyn-tools.json"
+line     = 6
+rule     = "BAS-MCP-010"
+category = "LLM01"
+kind     = "defect"
+severity = "high"
+why      = "The mul tool's description ends in a zero-width space (U+200B), invisible to a reader and present in the text the model reads."
+
+[[expect_none]]
+file = "clean/ordinary.bastyn-tools.json"
+why  = "A snapshot with an ordinary description, a ZWNJ and a left-to-right mark inside text, an emoji variation selector, and a null description -- none of them hidden-text or instruction phrasing."
+
+# ---------------------------------------------------------------------
+# BAS-LLM10-004 / BAS-LLM10-011: eval/exec and yaml.load are defects when
+# the operand traces to a parameter, a network read or a model/tool/request
+# result (directly or through calls over such a value), and observations
+# when its origin cannot be traced. BAS-LLM10-009: a list command whose
+# first element is a literal is not a composed shell command line.
+# ---------------------------------------------------------------------
+
+[[expect]]
+file     = "vulnerable/llm10_eval_yaml_traced_input.py"
+line     = 8
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "exec(compile(snippet.strip(), ...)) -- the executed code object is built by calls over a function parameter."
+
+[[expect]]
+file     = "vulnerable/llm10_eval_yaml_traced_input.py"
+line     = 13
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "exec(body) where body is the text of a network response."
+
+[[expect]]
+file     = "vulnerable/llm10_eval_yaml_traced_input.py"
+line     = 17
+rule     = "BAS-LLM10-011"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "yaml.load(text.strip()) with the default loader -- the parsed text is derived from a function parameter through a call."
+
+[[expect]]
+file     = "vulnerable/llm10_eval_yaml_traced_input.py"
+line     = 21
+rule     = "BAS-LLM10-011"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "yaml.load(text, Loader=yaml.UnsafeLoader) on a function parameter."
+
+[[expect]]
+file     = "observations/eval_yaml_untraced_operand.py"
+line     = 17
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "The executed text is a loop variable over a module-level dict of literals; it does not trace to a parameter or other external input."
+
+[[expect]]
+file     = "observations/eval_yaml_untraced_operand.py"
+line     = 22
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "The executed text is the result of a local helper applied to a module-level literal; it does not trace to external input."
+
+[[expect]]
+file     = "observations/eval_yaml_untraced_operand.py"
+line     = 27
+rule     = "BAS-LLM10-004"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "The evaluated code object is compiled from a syntax tree built by ast.parse, which is not traced back to its source text."
+
+[[expect]]
+file     = "observations/eval_yaml_untraced_operand.py"
+line     = 32
+rule     = "BAS-LLM10-011"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "yaml.load on the result of a local helper applied to a module-level literal; the text does not trace to external input."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_list_first_element.py"
+line     = 7
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "A list command with shell=True whose first element is a function parameter, not a literal program name."
+
+[[expect_none]]
+file = "clean/shell_list_literal_program.py"
+why  = "List commands with shell=True whose first element is a literal program name (double- and single-quoted); the remaining elements are arguments, not shell syntax."
+
+# =====================================================================
+# skills/ -- a download piped into a shell (BAS-SKILL-010, observation)
+# ==============================================================
+
+[[expect]]
+file     = "observations/skills/remote-installer/SKILL.md"
+line     = 11
+rule     = "BAS-SKILL-010"
+category = "LLM04"
+kind     = "observation"
+severity = "medium"
+why      = "The install step pipes a download from a URL straight into a shell, so whatever the address serves at that moment runs unchecked."
+
+[[expect]]
+file     = "observations/skills/remote-installer/SKILL.md"
+line     = 11
+rule     = "BAS-SKILL-011"
+category = "LLM04"
+kind     = "defect"
+severity = "medium"
+why      = "The install step is a fenced command that fetches an installer from a URL and runs it; the passage scores above the defect threshold."
+
+[[expect_none]]
+file = "clean/skills/checked-installer/SKILL.md"
+why  = "Installs with a package manager, or downloads the installer and checks it against a checksum before running it, and states that a download is never piped into a shell; none of the three is an unchecked download-and-run."
+
+# skills/ -- text that tells the reader to fetch code from a URL
+# (BAS-SKILL-011, scored by the bundled model)
+
+[[expect]]
+file     = "vulnerable/skills/prose-installer/SKILL.md"
+line     = 11
+rule     = "BAS-SKILL-011"
+category = "LLM04"
+kind     = "defect"
+severity = "medium"
+why      = "An Install section tells the reader to run an installer fetched from a URL in a fenced command; the passage scores above the defect threshold."
+
+[[expect]]
+file     = "vulnerable/skills/prose-installer/SKILL.md"
+line     = 11
+rule     = "BAS-SKILL-010"
+category = "LLM04"
+kind     = "observation"
+severity = "medium"
+why      = "The same fenced command pipes a download from a URL straight into a shell."
+
+[[expect_none]]
+file = "clean/skills/prose-warning/SKILL.md"
+why  = "Mentions downloading and a URL only to warn against piping a download into a shell and to say a hand-downloaded release should be checked against a published checksum; the passages score below the reporting threshold."
+
+# BAS-LLM10-012: a joined path is reported only when a non-literal segment
+# can be supplied from outside. clean/path_open_no_caller_input.py proves
+# exclude_if: no_caller_input; observations/path_open_helper_parameter.py
+# proves flow.unreached_parameter_downgrade; vulnerable/
+# llm10_path_traversal_entry_reach.py proves the two ways a path stays a
+# defect. See bastyn.yml's comment on BAS-LLM10-012 and
+# crate::flow::graph::FlowGraph::is_unreached_parameter_input.
+# =====================================================================
+
+[[expect_none]]
+file = "clean/path_open_no_caller_input.py"
+why  = "Every non-literal segment of each joined or interpolated path is a loop variable over os.listdir(), a name from uuid4(), a value read from a local settings file, or instance state (self.root) -- none is a function parameter, HTTP request data or a model/tool/retrieval result, so exclude_if: no_caller_input drops each match."
+
+[[expect]]
+file     = "observations/path_open_helper_parameter.py"
+line     = 17
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "observation"
+severity = "high"
+why      = "load_result(name): name is a parameter of a function that is not a recognized entry point and that no entry point in this file calls, so the caller is not visible and the match is reported as an observation rather than a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_path_traversal_entry_reach.py"
+line     = 19
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "load_report(name) is called by the @mcp.tool() function read_report with its own parameter, so the name is agent-chosen and the match stays a defect."
+
+[[expect]]
+file     = "vulnerable/llm10_path_traversal_entry_reach.py"
+line     = 31
+rule     = "BAS-LLM10-012"
+category = "LLM10"
+kind     = "defect"
+severity = "high"
+why      = "request.args[\"name\"] is HTTP request data, caller-chosen whoever calls serve_report(), so the match stays a defect even though the function is not a registered handler."
+
+[[expect]]
+file     = "observations/key_in_test_file.test.ts"
+line     = 2
+rule     = "BAS-ZT1-003"
+category = "ZT1"
+kind     = "observation"
+severity = "critical"
+why      = "A sk- shaped literal in a .test.ts file is reported as an observation, the default policy for findings in test paths."
+
+# ---------------------------------------------------------------------
+# BAS-ZT1-023 -- a literal with the exact format of a provider token.
+# ---------------------------------------------------------------------
+
+[[expect]]
+file     = "vulnerable/zt1_provider_tokens.py"
+line     = 8
+rule     = "BAS-ZT1-023"
+category = "ZT1"
+kind     = "defect"
+severity = "critical"
+why      = "a GitHub token (prefix, 36 alphanumeric characters) on a name that is not credential-shaped"
+
+[[expect]]
+file     = "vulnerable/zt1_provider_tokens.py"
+line     = 12
+rule     = "BAS-ZT1-023"
+category = "ZT1"
+kind     = "defect"
+severity = "critical"
+why      = "an npm token (prefix, 36 alphanumeric characters) in a dict value whose key is not credential-shaped"
+
+[[expect_none]]
+file = "clean/zt1_provider_token_near_misses.py"
+why  = "an environment read, the word token in setting names, a commit SHA, an image digest, an action pin, token-shaped values inside a URL, a markdown link target and a file path, placeholder bodies, and the published AWS example key"
+
+[[expect_none]]
+file = "clean/interpreter_shell.py"
+why  = "Shell commands made only of sys.executable and literal text, or of a module-level constant, are closed values and are not reported."
+
+[[expect]]
+file     = "vulnerable/llm10_shell_interpreter_with_parameter.py"
+line     = 11
+rule     = "BAS-LLM10-009"
+category = "LLM10"
+kind     = "defect"
+severity = "critical"
+why      = "The command mixes the fixed interpreter path with a caller-supplied package name, so it is not a closed value."
+
+# skills/ -- text that sends the reader to a payload it does not show
+# (BAS-SKILL-012)
+
+[[expect]]
+file     = "vulnerable/skills/hidden-payload/SKILL.md"
+line     = 10
+rule     = "BAS-SKILL-012"
+category = "LLM04"
+kind     = "defect"
+severity = "high"
+why      = "The Windows step links to an archive, gives its password and says to run it; the macOS step links to a public snippet and says to paste it into a terminal. Neither shows what runs."
+
+[[expect_none]]
+file = "clean/skills/payload-warning/SKILL.md"
+why  = "Mentions a snippet site, a password-protected archive and a decoded command piped into a shell only to warn against them."

@@ -3,6 +3,7 @@
 
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "a failed assumption in a test should fail the test"
 )]
 
@@ -169,7 +170,10 @@ def run_snippet(code):
 def handle(path):
     run_snippet(open(path).read())
 ";
-    assert!(scan_source(&ruleset, Path::new("app/handler.py"), source).is_empty());
+    assert_eq!(
+        scan_source(&ruleset, Path::new("app/handler.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
 }
 
 /// Migration has to be possible one rule at a time, so the two gates must be
@@ -243,7 +247,10 @@ rules:
     let source = "def handle(t):\n    \
                   plan = client.chat.completions.create(prompt=t).choices[0].message.content\n    \
                   eval(plan)\n";
-    assert!(scan_source(&ruleset, Path::new("app/handler.py"), source).is_empty());
+    assert_eq!(
+        scan_source(&ruleset, Path::new("app/handler.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
 }
 
 /// The graph is Python-only. A `flow:` rule in a language it cannot analyse is
@@ -327,6 +334,164 @@ rules:
     );
 }
 
+/// A `flow:` clause that omits `source:` entirely does not gate on
+/// provenance at all -- `BAS-LLM10-004`'s own new shape. Everything else in
+/// [`crate::flow`]'s composition (closed values, guards, builtin shadowing)
+/// still applies; only the "where did this come from" question is gone.
+const UNCONDITIONAL_FLOW_RULE: &str = r"
+rules:
+  - id: BAS-FLOW-030
+    title: eval() or exec() run on a non-literal expression
+    kind: defect
+    severity: high
+    confidence: medium
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      unguarded: true
+      builtin_callee: true
+    description: eval() runs a non-literal argument.
+    remediation: Do not.
+";
+
+/// The measurement this clause exists to fix: a value traced to a
+/// catalogued source and a value with no known origin at all must be
+/// treated identically -- both `Proven` -- since there is no source list
+/// left to tell them apart.
+#[test]
+fn a_sourceless_flow_clause_proves_a_traced_value() {
+    let ruleset = RuleSet::from_yaml(UNCONDITIONAL_FLOW_RULE).unwrap();
+    let source = "def handle(ticket):\n    plan = client.chat.completions.create(prompt=ticket).choices[0].message.content\n    eval(plan)\n";
+    let findings = scan_source(&ruleset, Path::new("app/handler.py"), source);
+    let finding = only(&findings);
+    assert_eq!(finding.kind, crate::finding::Kind::Defect);
+}
+
+#[test]
+fn a_sourceless_flow_clause_proves_an_untraceable_value_too() {
+    let ruleset = RuleSet::from_yaml(UNCONDITIONAL_FLOW_RULE).unwrap();
+    // `mystery` is an untraced function parameter -- no assignment, no call,
+    // nothing the flow graph can classify. With a `source:` list this would
+    // be `Unproven` or `Drop`; with none, it is `Proven`, exactly like the
+    // traced value above.
+    let findings = scan_source(
+        &ruleset,
+        Path::new("app/handler.py"),
+        "def handle(mystery):\n    eval(mystery)\n",
+    );
+    let finding = only(&findings);
+    assert_eq!(finding.kind, crate::finding::Kind::Defect);
+}
+
+/// `unguarded: true` still means what it says with no `source:`: a value
+/// already checked against a fixed set before reaching the sink is still not
+/// reported.
+#[test]
+fn a_sourceless_unguarded_flow_clause_still_drops_a_guarded_value() {
+    let ruleset = RuleSet::from_yaml(UNCONDITIONAL_FLOW_RULE).unwrap();
+    let source = "\
+ALLOWED = (\"a\", \"b\")
+
+
+def handle(value):
+    if value not in ALLOWED:
+        raise ValueError(value)
+    eval(value)
+";
+    assert!(!fires(&ruleset, source));
+}
+
+/// `builtin_callee: true` still means what it says with no `source:`: a call
+/// through a name this file rebinds itself is not the builtin, and is still
+/// not reported.
+#[test]
+fn a_sourceless_flow_clause_still_drops_a_call_through_a_shadowed_builtin() {
+    let ruleset = RuleSet::from_yaml(UNCONDITIONAL_FLOW_RULE).unwrap();
+    let source =
+        "def eval(value):\n    return value\n\n\ndef handle(mystery):\n    return eval(mystery)\n";
+    assert!(!fires(&ruleset, source));
+}
+
+/// `is_closed` still runs before the sourceless shortcut: a value built only
+/// from literals this file fixes is dropped the same as it would be with a
+/// `source:` list, not proven just because there is no provenance question
+/// left to ask. Only indirectly covered elsewhere by the
+/// `eval_guarded_by_local_check.py` corpus fixture; this pins it directly at
+/// the engine level.
+#[test]
+fn a_sourceless_flow_clause_still_drops_a_closed_value() {
+    let ruleset = RuleSet::from_yaml(UNCONDITIONAL_FLOW_RULE).unwrap();
+    assert!(!fires(
+        &ruleset,
+        "def handle():\n    x = \"a\" + \"b\"\n    eval(x)\n"
+    ));
+}
+
+/// `unproven:` only means something when there is a `source:` list for a
+/// value's origin to fail against -- with none, every non-closed, non-guarded
+/// value is already `Proven`, so the combination is a meaningless
+/// configuration, rejected at load time.
+#[test]
+fn unproven_without_source_fails_to_load() {
+    let yaml = r"
+rules:
+  - id: BAS-FLOW-031
+    title: eval() or exec() run on a non-literal expression
+    kind: defect
+    severity: high
+    confidence: medium
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      unguarded: true
+      unproven:
+        kind: observation
+    description: eval() runs a non-literal argument.
+    remediation: Do not.
+";
+    let error = RuleSet::from_yaml(yaml).unwrap_err();
+    assert!(
+        matches!(error, RuleError::UnprovenWithoutSource { .. }),
+        "{error:?}"
+    );
+}
+
+/// `flow.sink` with no `flow.source` would let the wrapper-sink pass report
+/// every call to a local wrapper whose argument is merely not closed and not
+/// guarded -- a materially broader, currently untested reach no shipped rule
+/// asks for. Rejected at load time rather than shipped silently.
+#[test]
+fn sink_without_source_fails_to_load() {
+    let yaml = r"
+rules:
+  - id: BAS-FLOW-032
+    title: eval() or exec() run on a non-literal expression
+    kind: defect
+    severity: high
+    confidence: medium
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      sink: code_execution
+    description: eval() runs a non-literal argument.
+    remediation: Do not.
+";
+    let error = RuleSet::from_yaml(yaml).unwrap_err();
+    assert!(
+        matches!(error, RuleError::FlowSinkWithoutSource { .. }),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn an_unknown_flow_field_is_a_load_error() {
     let yaml = r"
@@ -389,4 +554,641 @@ rules:
         fires(&ruleset, &shadowed),
         "missed a wrapper next to `execute_all`"
     );
+}
+
+/// A `flow:` rule with an unproven path, parameterised by its extra flow
+/// keys and its declared kind.
+fn unproven_rule(kind: &str, extra_flow: &str) -> String {
+    format!(
+        r"
+rules:
+  - id: BAS-FLOW-020
+    title: Model output run as a shell command
+    kind: {kind}
+    severity: critical
+    confidence: high
+    categories: [LLM10]
+    language: python
+    any:
+      - os.system($ARG)
+    flow:
+      variable: ARG
+      source: model_output
+      unguarded: true
+{extra_flow}
+    description: A value reaches os.system().
+    remediation: Do not.
+"
+    )
+}
+
+const UNPROVEN_WITH_REQUIRES: &str = "      unproven:
+        kind: observation
+        requires:
+          ARG: \"(?i)(response|reply)\"";
+
+fn only(findings: &[crate::finding::Finding]) -> &crate::finding::Finding {
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    &findings[0]
+}
+
+#[test]
+fn a_proven_source_keeps_the_declared_kind() {
+    let rules = RuleSet::from_yaml(&unproven_rule("defect", UNPROVEN_WITH_REQUIRES)).unwrap();
+    let source = "def run(client):\n    command = client.chat.completions.create(prompt='x').choices[0].message.content\n    os.system(command)\n";
+    let findings = scan_source(&rules, Path::new("app/run.py"), source);
+    let finding = only(&findings);
+    assert_eq!(finding.kind, crate::finding::Kind::Defect);
+    assert_eq!(finding.confidence, crate::finding::Confidence::High);
+    assert!(!finding.description.contains("could not be traced"));
+}
+
+#[test]
+fn an_untraceable_value_with_a_matching_name_is_an_observation() {
+    let rules = RuleSet::from_yaml(&unproven_rule("defect", UNPROVEN_WITH_REQUIRES)).unwrap();
+    let findings = scan_source(
+        &rules,
+        Path::new("app/run.py"),
+        "def run(response):\n    os.system(response)\n",
+    );
+    let finding = only(&findings);
+    assert_eq!(finding.kind, crate::finding::Kind::Observation);
+    assert_eq!(finding.confidence, crate::finding::Confidence::Low);
+    assert!(finding.description.ends_with(
+        "The origin of this value could not be traced within this file, so this is reported as an observation rather than a defect."
+    ), "{}", finding.description);
+}
+
+#[test]
+fn an_untraceable_value_whose_name_fails_requires_is_dropped() {
+    let rules = RuleSet::from_yaml(&unproven_rule("defect", UNPROVEN_WITH_REQUIRES)).unwrap();
+    assert_eq!(
+        scan_source(
+            &rules,
+            Path::new("app/run.py"),
+            "def run(command):\n    os.system(command)\n"
+        ),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+#[test]
+fn a_value_from_a_different_known_source_is_dropped_not_observed() {
+    let rules = RuleSet::from_yaml(&unproven_rule("defect", UNPROVEN_WITH_REQUIRES)).unwrap();
+    let source = "def run(path):\n    response = json.load(open(path))\n    os.system(response)\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("app/run.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+#[test]
+fn a_closed_value_is_dropped_even_with_an_unproven_path() {
+    let rules = RuleSet::from_yaml(&unproven_rule("defect", UNPROVEN_WITH_REQUIRES)).unwrap();
+    assert_eq!(
+        scan_source(
+            &rules,
+            Path::new("app/run.py"),
+            "response = \"printf hello\"\nos.system(response)\n"
+        ),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+#[test]
+fn a_guarded_value_is_dropped_even_with_an_unproven_path() {
+    let rules = RuleSet::from_yaml(&unproven_rule("defect", UNPROVEN_WITH_REQUIRES)).unwrap();
+    let source = "def run(response):\n    if response not in (\"ls\", \"pwd\"):\n        raise ValueError(response)\n    os.system(response)\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("app/run.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+#[test]
+fn an_unproven_path_without_requires_reports_any_untraceable_value() {
+    let rules = RuleSet::from_yaml(&unproven_rule(
+        "defect",
+        "      unproven:\n        kind: observation",
+    ))
+    .unwrap();
+    let findings = scan_source(
+        &rules,
+        Path::new("app/run.py"),
+        "def run(anything):\n    os.system(anything)\n",
+    );
+    assert_eq!(only(&findings).kind, crate::finding::Kind::Observation);
+}
+
+#[test]
+fn unproven_on_an_observation_rule_reports_an_untraceable_value() {
+    let rules = RuleSet::from_yaml(&unproven_rule("observation", UNPROVEN_WITH_REQUIRES)).unwrap();
+    let findings = scan_source(
+        &rules,
+        Path::new("app/run.py"),
+        "def run(response):\n    os.system(response)\n",
+    );
+    assert_eq!(only(&findings).kind, crate::finding::Kind::Observation);
+}
+
+#[test]
+fn unproven_kind_other_than_observation_fails_to_load() {
+    let err = RuleSet::from_yaml(&unproven_rule(
+        "defect",
+        "      unproven:\n        kind: defect",
+    ))
+    .unwrap_err();
+    assert!(matches!(err, RuleError::Yaml(_)), "{err}");
+}
+
+#[test]
+fn requires_naming_an_unbound_metavariable_fails_to_load() {
+    let err = RuleSet::from_yaml(&unproven_rule(
+        "defect",
+        "      unproven:\n        kind: observation\n        requires:\n          NOPE: \"x\"",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, RuleError::UnboundMetavariable { ref var, .. } if var == "NOPE"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_invalid_requires_regex_fails_to_load() {
+    let err = RuleSet::from_yaml(&unproven_rule(
+        "defect",
+        "      unproven:\n        kind: observation\n        requires:\n          ARG: \"(\"",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, RuleError::InvalidUnprovenRegex { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_unproven_observation_in_a_test_path_is_still_an_observation() {
+    let rules = RuleSet::from_yaml(&unproven_rule("defect", UNPROVEN_WITH_REQUIRES)).unwrap();
+    let findings = scan_source(
+        &rules,
+        Path::new("tests/test_run.py"),
+        "def run(response):\n    os.system(response)\n",
+    );
+    assert_eq!(only(&findings).kind, crate::finding::Kind::Observation);
+}
+
+const BUILTIN_RULE: &str = r"
+rules:
+  - id: BAS-FLOW-021
+    title: Model output executed as code
+    kind: defect
+    severity: critical
+    confidence: high
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      source: model_output
+      builtin_callee: true
+    description: Model output reaches eval().
+    remediation: Do not.
+";
+
+#[test]
+fn builtin_callee_drops_a_call_to_a_shadowed_eval() {
+    let rules = RuleSet::from_yaml(BUILTIN_RULE).unwrap();
+    let source = "def eval(value):\n    return value\n\ndef run(client):\n    text = client.responses.create(model='m', input='x').output_text\n    return eval(text)\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("app/run.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+#[test]
+fn builtin_callee_keeps_a_call_to_the_real_eval() {
+    let rules = RuleSet::from_yaml(BUILTIN_RULE).unwrap();
+    let source = "def run(client):\n    text = client.responses.create(model='m', input='x').output_text\n    return eval(text)\n";
+    assert_eq!(
+        scan_source(&rules, Path::new("app/run.py"), source).len(),
+        1
+    );
+}
+
+const BUILTIN_SINK_RULE: &str = r"
+rules:
+  - id: BAS-FLOW-023
+    title: Model output executed as code
+    kind: defect
+    severity: critical
+    confidence: high
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      source: model_output
+      sink: code_execution
+      builtin_callee: true
+    description: Model output reaches eval().
+    remediation: Do not.
+";
+
+/// The wrapper pass used to ignore `builtin_callee` entirely: it asked only
+/// whether a local function's body called something named `eval`, never
+/// whether that name still meant the real builtin by the time it ran. A file
+/// that shadows `eval` with its own identity function and then wraps *that*
+/// must not report a call through the wrapper, the same way a direct call to
+/// the shadowed name already does not.
+#[test]
+fn builtin_callee_drops_a_wrapper_call_through_a_shadowed_eval() {
+    let rules = RuleSet::from_yaml(BUILTIN_SINK_RULE).unwrap();
+    let source = "\
+def eval(v):
+    return v
+
+
+def run(code):
+    return eval(code)
+
+
+def handle(client):
+    model_text = client.responses.create(model='m', input='x').output_text
+    run(model_text)
+";
+    assert_eq!(
+        scan_source(&rules, Path::new("app/run.py"), source),
+        Vec::<crate::finding::Finding>::new()
+    );
+}
+
+/// The companion case: with no local `def eval`, the wrapper's `eval` really
+/// is the builtin, and the call through the wrapper is still reported.
+#[test]
+fn builtin_callee_keeps_a_wrapper_call_through_the_real_eval() {
+    let rules = RuleSet::from_yaml(BUILTIN_SINK_RULE).unwrap();
+    let source = "\
+def run(code):
+    return eval(code)
+
+
+def handle(client):
+    model_text = client.responses.create(model='m', input='x').output_text
+    run(model_text)
+";
+    let findings = scan_source(&rules, Path::new("app/run.py"), source);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+}
+
+#[test]
+fn the_wrapper_pass_reports_an_unproven_argument_only_without_requires() {
+    let with_requires = r"
+rules:
+  - id: BAS-FLOW-022
+    title: t
+    kind: defect
+    severity: critical
+    confidence: high
+    categories: [LLM10]
+    language: python
+    any:
+      - exec($ARG)
+    flow:
+      variable: ARG
+      source: model_output
+      sink: code_execution
+      unproven:
+        kind: observation
+        requires:
+          ARG: response
+    description: d
+    remediation: r
+";
+    let source =
+        "def runner(code):\n    exec(code)\n\ndef handle(response):\n    runner(response)\n";
+    let rules = RuleSet::from_yaml(with_requires).unwrap();
+    let findings = scan_source(&rules, Path::new("app/run.py"), source);
+    assert!(
+        findings.iter().all(|f| f.location.line != 5),
+        "no wrapper-call finding expected with requires: {findings:#?}"
+    );
+
+    let without = with_requires.replace("        requires:\n          ARG: response\n", "");
+    let rules = RuleSet::from_yaml(&without).unwrap();
+    let findings = scan_source(&rules, Path::new("app/run.py"), source);
+    let wrapper = findings
+        .iter()
+        .find(|f| f.location.line == 5)
+        .expect("a wrapper-call observation");
+    assert_eq!(wrapper.kind, crate::finding::Kind::Observation);
+}
+
+/// `request.json` is an attribute read, not a call, so the graph cannot
+/// classify it as request data. With a user-input-shaped name it must still
+/// surface as an observation rather than vanish.
+#[test]
+fn a_system_prompt_from_an_unclassified_request_attribute_is_an_observation() {
+    let rules = RuleSet::embedded().unwrap();
+    let source = "def handle(request):\n    user_query = request.json[\"q\"]\n    system_prompt = f\"Context: {user_query}\"\n";
+    let findings = scan_source(&rules, Path::new("app/handler.py"), source);
+    let zt4 = findings
+        .iter()
+        .find(|f| f.rule_id == "BAS-ZT4-001")
+        .expect("an observation");
+    assert_eq!(zt4.kind, crate::finding::Kind::Observation);
+}
+
+/// `BAS-ZT4-001` has `unguarded: true`, so a value already checked against a
+/// fixed set before reaching the interpolation is not reported at all -- the
+/// same guard every other flow-gated rule already honours.
+#[test]
+fn bas_zt4_001_skips_a_value_already_limited_by_a_fixed_set_check() {
+    let rules = RuleSet::embedded().unwrap();
+    let source = "def handle(request):\n    user_input = request.get_json()[\"q\"]\n    if user_input not in (\"a\", \"b\"):\n        return None\n    system_prompt = f\"Context: {user_input}\"\n";
+    let findings = scan_source(&rules, Path::new("app/handler.py"), source);
+    assert!(
+        findings.iter().all(|f| f.rule_id != "BAS-ZT4-001"),
+        "a guarded value must not be reported: {findings:#?}"
+    );
+}
+
+/// `flow.passthrough_downgrade` reports a bare pass-through of a
+/// non-entry-point function's own parameter as an observation, not a
+/// defect, when nothing in the file wires it to a recognized entry point.
+#[test]
+fn passthrough_downgrade_reports_a_bare_parameter_helper_as_an_observation() {
+    let rules = RuleSet::embedded().unwrap();
+    let source = "\
+import subprocess
+
+
+def run_shell_cmd(cmd):
+    return subprocess.run(cmd, shell=True)
+";
+    let findings = scan_source(&rules, Path::new("app/helpers.py"), source);
+    let finding = findings
+        .iter()
+        .find(|f| f.rule_id == "BAS-LLM10-009")
+        .expect("a BAS-LLM10-009 finding");
+    assert_eq!(finding.kind, crate::finding::Kind::Observation);
+}
+
+/// The companion case: the same bare-parameter shape inside a function
+/// decorated `@mcp.tool()` -- a recognized entry point -- must stay a
+/// defect, since this file itself hands that parameter an agent-chosen
+/// value.
+#[test]
+fn passthrough_downgrade_does_not_apply_inside_an_entry_point() {
+    let rules = RuleSet::embedded().unwrap();
+    let source = "\
+import subprocess
+
+
+@mcp.tool()
+def run_shell_cmd(cmd):
+    return subprocess.run(cmd, shell=True)
+";
+    let findings = scan_source(&rules, Path::new("app/helpers.py"), source);
+    let finding = findings
+        .iter()
+        .find(|f| f.rule_id == "BAS-LLM10-009")
+        .expect("a BAS-LLM10-009 finding");
+    assert_eq!(finding.kind, crate::finding::Kind::Defect);
+}
+
+/// A `source:` list with `caller_input: true` and `unproven:`, the shape the
+/// eval/exec and yaml.load rules use.
+const CALLER_INPUT_RULE_YAML: &str = r"
+rules:
+  - id: BAS-FLOW-040
+    title: eval() or exec() run on a non-literal expression
+    kind: defect
+    severity: high
+    confidence: medium
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+      - exec($ARG)
+    flow:
+      variable: ARG
+      source: [network_read]
+      caller_input: true
+      unguarded: true
+      unproven:
+        kind: observation
+    description: eval() runs a non-literal argument.
+    remediation: Do not.
+";
+
+fn caller_input_kind(source: &str) -> Option<crate::finding::Kind> {
+    let ruleset = RuleSet::from_yaml(CALLER_INPUT_RULE_YAML).unwrap();
+    let findings = scan_source(&ruleset, Path::new("app/handler.py"), source);
+    findings
+        .iter()
+        .find(|finding| finding.rule_id == "BAS-FLOW-040")
+        .map(|finding| finding.kind)
+}
+
+/// A parameter, and a value computed by calls over a parameter (as an
+/// argument or as a method receiver), carry caller input.
+#[test]
+fn caller_input_reaches_a_defect_directly_and_through_calls() {
+    for body in [
+        "def run(text):\n    eval(text)\n",
+        "def run(text):\n    eval(text.strip())\n",
+        "def run(text):\n    exec(compile(text, '<s>', 'exec'))\n",
+        "def run(text):\n    cleaned = normalise(text)\n    exec(cleaned)\n",
+        "import requests\n\ndef run(url):\n    exec(requests.get(url).text)\n",
+    ] {
+        assert_eq!(
+            caller_input_kind(body),
+            Some(crate::finding::Kind::Defect),
+            "{body}"
+        );
+    }
+}
+
+/// A value that neither carries caller input nor comes from a listed source
+/// is reported as an observation.
+#[test]
+fn an_untraced_operand_is_an_observation() {
+    for body in [
+        "SCAFFOLDS = {'a': 'x = 1'}\n\ndef run():\n    for name, code in SCAFFOLDS.items():\n        exec(code)\n",
+        "TEMPLATE = 'x = 1'\n\ndef run():\n    source = render(TEMPLATE)\n    exec(source)\n",
+        "import ast\n\ndef run(text):\n    tree = ast.parse(text, mode='eval')\n    eval(compile(tree, '<e>', 'eval'))\n",
+    ] {
+        assert_eq!(
+            caller_input_kind(body),
+            Some(crate::finding::Kind::Observation),
+            "{body}"
+        );
+    }
+}
+
+/// A literal wrapped in `compile` carries no caller input, so it is an
+/// observation rather than a defect.
+#[test]
+fn a_compiled_literal_is_an_observation() {
+    assert_eq!(
+        caller_input_kind("def run():\n    eval(compile('1 + 1', '<s>', 'eval'))\n"),
+        Some(crate::finding::Kind::Observation)
+    );
+}
+
+/// The kind of the `BAS-LLM10-012` finding in `source`, if there is one.
+fn path_open_kind(source: &str) -> Option<crate::finding::Kind> {
+    let rules = RuleSet::embedded().unwrap();
+    scan_source(&rules, Path::new("app/files.py"), source)
+        .iter()
+        .find(|f| f.rule_id == "BAS-LLM10-012")
+        .map(|f| f.kind)
+}
+
+/// A path whose non-literal segments are a loop variable over a directory
+/// listing carries no caller input, so nothing is reported.
+#[test]
+fn path_open_with_a_loop_variable_is_not_reported() {
+    let source = "\
+import os
+
+
+def read_all(root_dir):
+    for name in os.listdir('/srv/data'):
+        with open(os.path.join('/srv/data', name)) as handle:
+            handle.read()
+";
+    assert_eq!(path_open_kind(source), None);
+}
+
+/// A name from an internal call and instance state are not caller input.
+#[test]
+fn path_open_with_a_generated_name_or_instance_state_is_not_reported() {
+    let generated = "\
+import os
+import uuid
+
+
+def write(payload):
+    name = f'{uuid.uuid4().hex}.txt'
+    open(os.path.join('/srv/data', name), 'w').write(payload)
+";
+    assert_eq!(path_open_kind(generated), None);
+    let instance = "\
+import os
+
+
+class Store:
+    def read(self):
+        return open(os.path.join(self.root, 'index.txt')).read()
+";
+    assert_eq!(path_open_kind(instance), None);
+}
+
+/// A parameter of a helper that no entry point reaches is an observation.
+#[test]
+fn path_open_with_an_unreached_helper_parameter_is_an_observation() {
+    let source = "\
+import os
+
+
+def load(name):
+    return open(os.path.join('/srv/data', name)).read()
+";
+    assert_eq!(
+        path_open_kind(source),
+        Some(crate::finding::Kind::Observation)
+    );
+}
+
+/// `caller_input:` only changes which values count as proven against a
+/// `source:` list; with no list there is nothing for it to change.
+#[test]
+fn caller_input_without_source_fails_to_load() {
+    let yaml = r"
+rules:
+  - id: BAS-FLOW-041
+    title: eval() or exec() run on a non-literal expression
+    kind: defect
+    severity: high
+    confidence: medium
+    categories: [LLM10]
+    language: python
+    any:
+      - eval($ARG)
+    flow:
+      variable: ARG
+      caller_input: true
+    description: eval() runs a non-literal argument.
+    remediation: Do not.
+";
+    let error = RuleSet::from_yaml(yaml).unwrap_err();
+    assert!(
+        matches!(error, RuleError::CallerInputWithoutSource { .. }),
+        "{error:?}"
+    );
+}
+
+/// The same parameter inside an `@mcp.tool()` function is a defect.
+#[test]
+fn path_open_with_an_entry_point_parameter_is_a_defect() {
+    let source = "\
+import os
+
+
+@mcp.tool()
+def load(name):
+    return open(os.path.join('/srv/data', name)).read()
+";
+    assert_eq!(path_open_kind(source), Some(crate::finding::Kind::Defect));
+}
+
+/// A helper an entry point calls with its own parameter is a defect.
+#[test]
+fn path_open_in_a_helper_called_from_an_entry_point_is_a_defect() {
+    let source = "\
+import os
+
+
+def load(name):
+    return open(os.path.join('/srv/data', name)).read()
+
+
+@app.route('/file')
+def serve(name):
+    return load(name)
+";
+    assert_eq!(path_open_kind(source), Some(crate::finding::Kind::Defect));
+}
+
+/// HTTP request data stays a defect even outside a registered handler.
+#[test]
+fn path_open_with_request_data_is_a_defect() {
+    let source = "\
+import os
+from flask import request
+
+
+def serve():
+    return open(os.path.join('/srv/data', request.args['name'])).read()
+";
+    assert_eq!(path_open_kind(source), Some(crate::finding::Kind::Defect));
+}
+
+/// One caller-chosen segment among local ones is enough.
+#[test]
+fn path_open_mixing_a_local_and_a_request_segment_is_a_defect() {
+    let source = "\
+import os
+from flask import request
+
+
+def serve():
+    base = os.getcwd()
+    return open(f'{base}/{request.form[\"name\"]}').read()
+";
+    assert_eq!(path_open_kind(source), Some(crate::finding::Kind::Defect));
 }

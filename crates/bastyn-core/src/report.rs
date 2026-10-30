@@ -18,6 +18,14 @@ pub enum CveStatus {
         /// How many dependencies were resolved and looked up.
         dependencies: usize,
     },
+    /// Queried, but some follow-up requests failed or came back unreadable,
+    /// so some dependencies' results may be missing.
+    Partial {
+        /// How many dependencies were looked up.
+        dependencies: usize,
+        /// How many of them may have advisories missing from this report.
+        incomplete: usize,
+    },
     /// Skipped because no dependency manifest was found.
     NoManifest,
     /// Skipped on purpose, via `--offline`.
@@ -40,7 +48,8 @@ pub enum CveStatus {
 /// Ordered so the report lists the deliberate exclusions before the ones the
 /// scan hit by accident: a pattern the caller typed is a decision they can
 /// revisit, an unreadable file is not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SkipReason {
     /// An `--exclude` pattern matched.
     Excluded,
@@ -110,6 +119,116 @@ impl SkipReason {
             Self::Unstated => {
                 "1 path was not covered, for a reason this report did not record:".into()
             }
+        }
+    }
+}
+
+/// Which agent files a scan covered, by kind, and what it skipped.
+///
+/// Every key is always serialised, except `remote_servers`, which is omitted
+/// when empty (it is filled only when `--inspect-remote` ran). An empty
+/// `mcp_manifests` says that no MCP configuration was parsed, which is
+/// information a consumer needs and cannot get from the absence of a key.
+/// Paths use forward slashes and are relative to the scanned root, in the
+/// order the scan walked them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Coverage {
+    /// MCP configuration files that were read and parsed. A config that was
+    /// read but did not parse is not listed here: it is reported as a
+    /// `BAS-MCP-000` finding instead.
+    #[serde(default)]
+    pub mcp_manifests: Vec<String>,
+    /// `SKILL.md` files that were read.
+    #[serde(default)]
+    pub skill_files: Vec<String>,
+    /// Text files of a skill that were scanned (`references/` and files next
+    /// to the manifest): `.md`, `.markdown` and `.txt` files read and checked
+    /// for the skill phrase checks and hidden Unicode. A file that could not be
+    /// read is listed under `skipped` instead. Sorted by path.
+    #[serde(default)]
+    pub skill_reference_files: Vec<String>,
+    /// Shell and PowerShell scripts (`.sh`, `.bash`, `.zsh`, `.ps1`) inside a
+    /// skill folder that were read and checked for commands that download code
+    /// and run it. Omitted from the JSON when empty. Sorted by path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_script_files: Vec<String>,
+    /// Agent instruction files (such as `AGENTS.md`) that were read. An MCP
+    /// configuration is listed only under `mcp_manifests`, and a `SKILL.md`
+    /// only under `skill_files`, never here.
+    #[serde(default)]
+    pub instruction_files: Vec<String>,
+    /// Files located under a skill directory (the directory of a `SKILL.md`,
+    /// at any depth) that no analyser reads, such as images. They are present in the skill but were not inspected. A file
+    /// that was skipped as unreadable or unparseable is listed under `skipped`
+    /// only. For a `SKILL.md` at the scan root, only the `scripts/`,
+    /// `references/` and `assets/` folders are considered, never the rest of
+    /// the repository. Each file is listed once, sorted bytewise by path.
+    #[serde(default)]
+    pub skill_unanalysed: Vec<String>,
+    /// The structured form of [`Report::skipped`]: the same entries in the
+    /// same order, with the reason as data.
+    #[serde(default)]
+    pub skipped: Vec<CoveredSkip>,
+    /// The remote server entries `--inspect-remote` considered, in config
+    /// and entry order. Empty, and omitted from the JSON, unless that option
+    /// ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_servers: Vec<RemoteServer>,
+}
+
+/// What happened to one remote server entry during `--inspect-remote`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteStatus {
+    /// The server was contacted and its tools were checked.
+    Inspected,
+    /// The URL is not a public `https` address, so it was not contacted.
+    NotPublic,
+    /// The entry carries credentials, headers or a variable placeholder, so it
+    /// was not contacted, or the server answered 401 or 403.
+    NeedsCredentials,
+    /// The entry is not a Streamable HTTP server: a command, or SSE. A server
+    /// that turns out to use SSE is only recognised after it was contacted.
+    Unsupported,
+    /// The server was contacted and the capture failed.
+    Unreachable,
+    /// The entry was eligible but `--offline` forbids contacting it.
+    Offline,
+}
+
+/// One server entry considered by `--inspect-remote`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteServer {
+    /// The config file, relative to the scanned root.
+    pub file: String,
+    /// The entry's name in that file.
+    pub server: String,
+    /// What happened to it.
+    pub status: RemoteStatus,
+    /// Number of tools captured; present only when inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<usize>,
+}
+
+/// The structured form of one [`Report::skipped`] line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoveredSkip {
+    /// What the entry is about, as in [`Skip::path`].
+    pub path: String,
+    /// Why the path is not covered.
+    pub reason: SkipReason,
+    /// The one thing that differs between entries sharing a reason, as in
+    /// [`Skip::detail`]. Omitted when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+impl From<&Skip> for CoveredSkip {
+    fn from(skip: &Skip) -> Self {
+        Self {
+            path: skip.path.clone(),
+            reason: skip.reason,
+            detail: skip.detail.clone(),
         }
     }
 }
@@ -322,6 +441,15 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skip>,
 
+    /// The paths the scan covered, per kind of agent file, and the skipped
+    /// paths with their reasons as data.
+    ///
+    /// `coverage.skipped` is exactly [`Report::skipped`], in the same order,
+    /// with the reason as a field instead of prose. `skipped` itself is
+    /// unchanged because it is a published contract.
+    #[serde(default)]
+    pub coverage: Coverage,
+
     /// The findings regrouped by the areas of each compliance framework they
     /// are relevant to, one entry per framework.
     ///
@@ -344,4 +472,58 @@ pub struct Report {
     /// consumer reading this field cannot avoid reading what it does not mean.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crosswalks: Vec<crate::compliance::Crosswalk>,
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "a failed assumption in a test should fail the test"
+)]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn remote_servers_are_omitted_when_empty() {
+        let value = serde_json::to_value(Coverage::default()).unwrap();
+        assert!(value.get("remote_servers").is_none());
+        let back: Coverage = serde_json::from_value(value).unwrap();
+        assert_eq!(back.remote_servers.len(), 0);
+    }
+
+    #[test]
+    fn a_remote_server_serialises_with_a_snake_case_status() {
+        let coverage = Coverage {
+            remote_servers: vec![RemoteServer {
+                file: "mcp.json".into(),
+                server: "docs".into(),
+                status: RemoteStatus::Inspected,
+                tools: Some(3),
+            }],
+            ..Coverage::default()
+        };
+        let value = serde_json::to_value(&coverage).unwrap();
+        assert_eq!(
+            value["remote_servers"],
+            serde_json::json!([
+                {"file": "mcp.json", "server": "docs", "status": "inspected", "tools": 3}
+            ])
+        );
+        let back: Coverage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, coverage);
+    }
+
+    #[test]
+    fn tools_are_omitted_when_none() {
+        let server = RemoteServer {
+            file: "mcp.json".into(),
+            server: "docs".into(),
+            status: RemoteStatus::NeedsCredentials,
+            tools: None,
+        };
+        let value = serde_json::to_value(&server).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"file": "mcp.json", "server": "docs", "status": "needs_credentials"})
+        );
+    }
 }

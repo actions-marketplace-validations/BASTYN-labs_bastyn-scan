@@ -6,6 +6,297 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-17
+
+### Added
+
+- **`BAS-SKILL-012` reports skill text that sends the reader to a payload it does not show.** A link to a public paste or snippet site next to an instruction to run it in a terminal, a link to an archive or executable with a password and an instruction to run it, and a base64-decoded command piped into a shell are defects. Passages that read as a warning or as a description of an attack are skipped. One finding per file.
+- **`BAS-SKILL-011` scores passages of skill text that tell the reader to fetch code from a URL.** A small bundled model scores each passage around a download word; passages scoring high with a URL are defects, lower ones are observations.
+
+## [0.7.0] - 2026-10-16
+
+### Changed
+
+- **`BAS-INFRA-006` (credential in a Dockerfile or Compose file) is now an observation.** The matched code does not show whether the value is a real credential. Severity is unchanged.
+- **`BAS-MCP-002` (MCP server reached over plaintext HTTP without authentication) and `BAS-MCP-005` (MCP server launched from a registry without a version pin) are now observations.** The server configuration alone does not show where the host or the launched package comes from.
+- **`BAS-ZT2-002` (wildcard tool grant) is now an observation.** The matched code does not show where the grant comes from or what the tools can reach.
+- **`BAS-LLM10-017` (SQL built by interpolation reaches execution) is now an observation.** The matched code does not show where the interpolated value comes from.
+
+These rules still run. Their findings appear with `--show-observations` and never fail a run.
+
+- **The hardcoded-credential rules `BAS-ZT1-001`, `-002`, `-003`, `-010`, `-011`, `-019`, `-020` and `-022`, and `BAS-LLM02-001`, `-002`, `-004` and `-005`, now report observations instead of defects.** The matched code does not show where a value comes from or whether it is a live credential. The rules still run, with unchanged matching, severities and remediation text, and their findings appear with `--show-observations`. They no longer count toward `--fail-on`.
+- **`BAS-ZT1-003` follows the default test-path policy.** A key-shaped literal in a test file is an observation like any other finding in a test path.
+
+- **`BAS-LLM10-004` no longer reports `eval()`/`exec()` on a value limited to digits, whitespace, parentheses and `+ - * / % .` operators.** The limit can be a `re.fullmatch` (or anchored `re.match`/`re.search`) on a single character class that rejects the value, a `re.sub` that deletes every character outside such a class, an `isdigit()`/`isdecimal()` check, or an `all(c in "..." for c in value)` check. A class that admits a letter, underscore, quote or bracket other than a parenthesis does not count, and the check stops counting if the value is reassigned afterwards.
+
+- **`BAS-LLM10-009` no longer reports a shell command made only of literal text, module-level constants and `sys.executable`.** A command with any other non-literal part is reported as before.
+
+### Added
+
+- **`BAS-SKILL-010` reports text, or a shell or PowerShell script inside a skill folder, that downloads code from a URL and runs it with no check.** It reads a download piped or passed into a shell (`curl URL | sh`, `bash <(curl URL)`, `irm URL | iex`), a script or executable downloaded to a file and then run, and a cloned repository whose `install`, `setup` or `bootstrap` script is then run. It needs a literal `http` or `https` URL, and is skipped when a checksum, signature or review step sits between the download and the run, or when the text refuses or quotes the command. Observation only.
+- **Shell and PowerShell scripts (`.sh`, `.bash`, `.zsh`, `.ps1`) inside a skill folder are now read**, and are listed in the new `coverage.skill_script_files` (omitted from the JSON when empty) instead of `coverage.skill_unanalysed`.
+- **`bastyn scan --inspect-remote` captures the tool lists of the public https MCP servers named in config files, checks them with `BAS-MCP-010` to `-012`, and lists every server it did not contact under Coverage gaps.** It is off by default, `--offline` overrides it, and `--save-snapshots <DIR>` keeps the captures.
+- **`BAS-ZT1-023` reports a committed provider token by its exact format.** It covers GitHub tokens, AWS access key IDs, Google API keys, npm tokens and Stripe live secret keys, in any source, instruction, MCP or `.env` file. It never keys on a variable name, and skips values inside URLs, Markdown link targets, file paths, digests and placeholders.
+
+### Changed
+
+- **`BAS-SKILL-002` (instruction-override phrasing) is now an observation.** The text alone does not show whether the file tells the agent to follow the phrase or only quotes it. It is shown with `--show-observations` and never fails a run.
+- **`BAS-LLM01-001` (hidden Unicode characters in an instruction file) is now an observation.** The matched characters do not show whether a concealed instruction follows them; a file can list, quote or describe them. The conditions that decide whether to report are unchanged, and the description now asks a reviewer to confirm.
+- **`BAS-ZT4-001` and `BAS-ZT4-002` (user input or a caller-supplied override folded into a system prompt) are now observations.** The matched code does not show where the value comes from. Matching conditions are unchanged.
+- **A rule declared `kind: observation` may now carry a `flow.unproven` clause.** It was previously rejected at load time.
+- **`BAS-LLM10-012` reports a joined or interpolated file path only when a non-literal part of it can be supplied from outside.** A path built only from loop variables, generated names, values read from a local settings file or instance state is no longer reported. A path whose only outside input is a function parameter is an observation unless the function is an agent tool or web route handler, or is called from one in the same file. A path that carries HTTP request data, or a model, tool or retrieval result, is still a defect.
+- **`BAS-LLM10-004` reports a defect only when the evaluated text traces to input from outside; `BAS-LLM10-011` stays an observation.** That means a function parameter, HTTP request data, a model or tool result or a network read, including a value computed by calls over one of those (`compile(text)`, `text.strip()`). When the text cannot be traced to any of them, for example a loop variable over a dict of literals, the result of a helper that only sees literals, the contents of a fixed file or a value parsed with `ast.parse`, the call is an observation (shown with `--show-observations`). `BAS-LLM10-011` no longer matches `yaml.load` calls that pass a loader as a second positional argument.
+- **`BAS-LLM10-009` no longer reports a command given as a list whose first element is a string literal** (for example `subprocess.run(["start", path], shell=True)`). The remaining list elements are arguments, not shell syntax. A list whose first element is not a literal is still reported.
+
+## [0.6.0] - 2026-10-15
+
+### Added
+
+- **New checks `BAS-MCP-010` to `BAS-MCP-012` run on tools snapshot files (`*.bastyn-tools.json`)**: hidden Unicode in tool text, hidden-instruction markers, and instruction-override phrases.
+- **`bastyn inspect-server`**, an explicit command that connects to an MCP server over Streamable HTTP or stdio and writes its tool list to a snapshot file. `bastyn scan` itself still makes no connection to MCP servers.
+- **The text report now has a "Files read" section, and `--show-coverage` lists every file in it.** The section always prints a count of skill files, skill reference files, MCP configs and instruction files that were read, so a clean result shows whether skills were checked. With `--show-coverage` it also lists each path, grouped by kind. JSON, SARIF, findings and exit codes are unchanged. The GitHub Action has a matching `show-coverage` input.
+
+### Fixed
+
+- **`BAS-MCP-011` and `BAS-MCP-012` on tools snapshot files now match across line breaks and repeated spaces, and `BAS-MCP-012` also matches common variants such as `ignore all previous instructions`, `disregard all prior instructions` and `forget your instructions`.** Phrases are now matched as whole words, so `disregard priority` no longer matches.
+
+## [0.5.0] - 2026-10-14
+
+### Added
+
+- **`BAS-LLM04-002` reports JavaScript or TypeScript that runs a package-manager install as a child process**, such as `spawnSync("npm", ["install", ...])`, because the code then fetches third-party code at runtime. Observation only.
+- **`BAS-SKILL-004` reports a skill that tells the agent to start a diagram library with its `loose` security level**, which lets diagram text run scripts. It is an observation (shown with `--show-observations`) and is skipped when the text is refusing it.
+- **`BAS-SKILL-005` reports a skill that tells the agent to ask the user to paste a key, token or password into the conversation.** Observation only; skipped when the text refuses it.
+- **`BAS-SKILL-006` reports a skill that tells the agent to read issue or pull request text** (`gh issue view`, `gh pr diff` and similar), which anyone who can open an issue or pull request can write. Observation only; skipped when the text refuses it.
+- **`BAS-SKILL-007` reports a skill that tells the agent to install further skills** (`npx skills add ...`), which extends the set of instructions the agent trusts. Observation only; skipped when the text refuses it.
+- **`BAS-SKILL-008` reports a skill template that loads a script from a public CDN host**, so the page it produces runs code the skill does not pin. Observation only; skipped when the text refuses it.
+- **`BAS-SKILL-009` reports a skill that tells the agent to check out a pull request and run it**, which executes code the agent did not write. Observation only; skipped when the text refuses it.
+- **Rule files: a rule may declare `requires_in_file`**, the positive counterpart of `none_in_file`: a match is kept only when one of the listed patterns also matches somewhere in the same file, with shared metavariables bound to the same text. It cannot be combined with `flow.sink`.
+- **MCP configuration: new check `BAS-MCP-006`** for shell-wrapper launchers (`sh -c`, `bash -c`, `cmd /c`, `powershell -Command`) that download and run code; root-path and version-pin checks now also apply to a registry launcher inside such a wrapper.
+- **MCP configuration: new checks `BAS-MCP-007`** (container launched with `--privileged` or the Docker socket mounted) **and `BAS-MCP-008`** (host network, reported as an observation). `BAS-MCP-001` now also flags a root or home bind mount.
+- **MCP configuration: new check `BAS-MCP-009`** for a literal credential in a server URL's query string. A server entry's optional `type` / `transport` key is now read; it never causes a config to be reported as invalid.
+
+### Changed
+
+- **Skill checks now also read text files next to a `SKILL.md`** (for example a template file beside it), not only files under `references/`. README, LICENSE, CHANGELOG and similar documentation files are skipped, and a skill at the scan root still claims only its `references/` folder.
+- **Skill phrase checks now match whole words**: a phrase no longer matches inside a longer word, and a trailing plural `s` is still accepted.
+
+### Fixed
+
+- **`BAS-ZT1-003` no longer reports a provider-key-shaped literal that contains the word `secret` or `leak`**, such as the dummy values used in test fixtures. A random-looking key is still reported.
+- **`BAS-ZT1-011` no longer reports a cookie name that starts with `__Host-` or `__Secure-`** as a hardcoded credential. Any other literal under a credential-shaped name is judged as before.
+
+## [0.4.0] - 2026-10-14
+
+### Added
+
+- **Rules: `BAS-ZT3-001` and `BAS-ZT3-002`** report an HTTP MCP server (Python, TypeScript/JavaScript) that binds all interfaces with no authentication visible in the same file, as an observation.
+- **A terminal recording in the README.** `docs/demo/demo.gif` shows `bastyn scan` on a folder with code, skill, MCP and dependency findings.
+- **`BAS-SKILL-002`, `BAS-SKILL-003` and the hidden-Unicode check now read a skill's `references/` files.** Text files (`.md`, `.markdown`, `.txt`) under `<skill>/references/` are checked like the `SKILL.md` they belong to, and are listed in the new `coverage.skill_reference_files`. A root-level `SKILL.md` claims only its own `references/` folder. A reference file never gets `BAS-SKILL-001`.
+- **`coverage.skill_unanalysed` in the JSON report.** It lists the files inside a skill folder that no analyser reads (for example images and shell scripts), sorted, so a clean result shows what it did not cover. Files that were skipped as unreadable or unparseable stay in `coverage.skipped` only.
+- **An agent skill for `bastyn scan`.** `skills/bastyn-scan/SKILL.md` teaches a coding agent how to run a scan, read the exit codes, tell defects from observations, and report coverage gaps. It installs with `npx skills add BASTYN-labs/bastyn-scan`.
+
+### Changed
+
+- **`BAS-SKILL-003` now reports an observation instead of a defect**, because the repository cannot show whether skipping confirmation is wrong for that skill. A scan whose only skill finding is `BAS-SKILL-003` no longer reaches `--fail-on high` or `critical` (exit code 1) because of it; the finding is shown with `--show-observations`.
+- **`BAS-SKILL-002` and `BAS-SKILL-003` no longer report a phrase that the text is refusing or quoting.** A phrase is skipped when an earlier refusal or negation cue sits in the same sentence, when the phrase is inside a quotation and its paragraph (or the lead-in of its list) carries a refusal cue, or, for `BAS-SKILL-002`, when it is inside a fenced block with a refusal or detection cue in the paragraph next to the fence. A cue in a neighbouring sentence, list item or paragraph does not excuse a phrase, and a fenced phrase with no such cue is still reported. A cue earlier in the same sentence can still excuse a phrase that follows it; this is a known limit.
+- **The `BAS-SKILL-002` remediation text** no longer suggests fencing the phrase (the check reads fenced text too); it now suggests introducing a documented example with a sentence that says the agent must refuse it.
+- **Dependencies:** `rustls` is updated to 0.23.46, which fixes RUSTSEC-2026-0346 to 0349 in the HTTP client used for vulnerability lookups. `ast-grep-core` and `ast-grep-language` are updated to 0.50, `sha2` to 0.11 and `serde_json` to its latest patch release.
+- **The agent skill no longer installs Bastyn with the install script.** If neither Homebrew nor Cargo is available, it asks the user to install Bastyn from the README instructions.
+
+### Fixed
+
+- **`BAS-ZT1-010` and `BAS-ZT1-011` reported a plain endpoint URL as a hardcoded credential** when the variable name contained a word such as `token` or `secret`. A value that is an `http(s)` URL containing none of `@`, `?`, `#`, `=` or `;` is no longer reported; a URL with userinfo or a query string is still reported. Known limit: a token embedded in the URL path (for example a webhook path segment) is not reported.
+- **`BAS-LLM01-001` no longer reports the official England, Scotland and Wales flag emoji, or a zero width joiner placed directly between two emoji.** Any other tag-character run, and any other use of a joiner, is still reported.
+
+## [0.3.0] - 2026-10-09
+
+### Added
+
+- **`coverage` in the JSON report.** `bastyn scan --format json` now has a top-level `coverage` object listing the MCP configs that were read and parsed (`mcp_manifests`), the `SKILL.md` files (`skill_files`) and the other instruction files (`instruction_files`), plus `coverage.skipped`, the `skipped` array with each reason as a field. The existing `skipped` array is unchanged.
+
+## [0.2.2] - 2026-10-02
+
+### Changed
+
+- The GitHub Marketplace listing name is now "Instant AI Agent Security & Assurance scan - BASTYN Community".
+
+## [0.2.1] - 2026-10-02
+
+### Changed
+
+- The GitHub Marketplace listing name is now "BASTYN Community - Instant AI Agent Security & Assurance scan".
+
+## [0.2.0] - 2026-10-02
+
+### Added
+
+- **Anonymous scan summary.** After a completed scan, `bastyn scan` sends one counts-only summary
+  (finding counts by rule ID, severity and kind, coverage counts, scan status, scanner version, a
+  hashed project ID, a run ID, timestamps, and CI-or-local). It never contains file paths, code,
+  finding text, dependency names or the repository name. The first run prints a notice on stderr.
+  A failed upload never changes the report, the machine-readable output or the exit code. Turn it
+  off with `--no-reporting`, `--offline`, or `DO_NOT_TRACK` set to a value other than `0`. See
+  "Reporting" in the README.
+- **`--no-reporting`** on `bastyn scan`.
+- **`bastyn project-id [PATH] [--explain]`** prints the project ID scans of a directory report
+  under, and what was hashed to get it. It writes no file and uses no network.
+
+### Changed
+
+- `--offline` now also disables the summary upload, in addition to skipping the CVE lookup.
+
+### Breaking
+
+- **Minimum supported Rust version raised from 1.88 to 1.90.** A routine dependency bump pulled in a
+  newer `tree-sitter` and `tree-sitter-language` (transitive dependencies of `ast-grep-language`) that
+  require rustc 1.90, breaking the project's previous 1.88 floor. Raised the declared MSRV to match
+  rather than pin the dependency back, since 1.90 is over a year old and not a meaningful floor for
+  users on stable or recent-stable toolchains.
+
+## [0.1.8] - 2026-09-28
+
+### Breaking (library API)
+
+- `CveStatus` gains a `Partial` variant; a `match` on `CveStatus` outside this crate that is not
+  already exhaustive-with-a-wildcard must add an arm for it.
+- `bastyn_core::infra::inspect` now returns `Result<Vec<Finding>, InfraError>` instead of
+  `Vec<Finding>`, so an unparseable Compose file can be reported as skipped instead of scanned.
+
+### Changed
+
+- **Defects now require traced provenance.** `BAS-LLM10-002`, `-003`, `BAS-ZT4-001` and `-002` ask the
+  Python flow graph where a value came from. A value traced to an untrusted source is a defect. A
+  literal, a value built only from literals, and one already limited by a fixed-set check are not
+  reported. A value whose origin cannot be traced in the file is reported as a low-confidence
+  observation, only when its name matches the rule's former name list. Model output reaching a shell
+  or SQL is now found under any variable name when the file itself shows the value came from a model
+  call.
+- **`BAS-LLM10-004` (`eval()`/`exec()` on a non-literal argument) no longer gates on provenance at
+  all.** It previously asked the flow graph where the argument came from, same as the rules above,
+  with a `source:` list that already named every `SourceKind` this engine knows: traced to one of
+  them it was a defect, traced to nowhere (an untraceable origin, such as a bare function parameter)
+  it was a hidden, low-confidence observation behind `flow.unproven`, out of the default report. That
+  gate was hiding real findings for little precision gained — legitimate `eval()`/`exec()` on a
+  non-literal value is rare — so an untraceable origin is now reported as a defect unconditionally,
+  the same composition-is-the-defect philosophy `BAS-LLM10-009`/`-017`/`-018` already use. A value the
+  flow graph proves is built only from literals this file fixes, or one a guard already dominates, is
+  still not reported, and a call through a locally rebound `eval`/`exec` name is still not the builtin
+  — only the provenance requirement is gone. This can surface a call previously visible only with
+  `--show-observations` as a defect that affects a scan's exit code.
+- **The provenance-based downgrade above does not apply to `BAS-LLM10-004`, `-009`, `-017`, or
+  `-018`.** These rules report a defect unconditionally on the composition they match — `eval()`/
+  `exec()` on a non-literal argument, a non-literal command reaching a shell, or an unparameterized
+  query reaching execution — regardless of whether the specific value's provenance can be traced in
+  the file. At a location where both one of these unconditional rules and a provenance-gated rule above
+  would match, the unconditional rule's defect is what gets reported: the engine keeps a defect over an
+  observation at the same location. This can change a scan's exit code for a codebase that previously
+  relied on the provenance-gated behavior alone to keep that location at observation level.
+- **Observation-only rules.** `BAS-LLM10-005`, `-006`, `-007` and `BAS-ZT4-003` (TypeScript and
+  JavaScript, which have no dataflow graph yet) and `BAS-LLM03-001`/`-002` (tool name only) now
+  report observations. They appear with `--show-observations` and never affect the exit code.
+- `BAS-LLM10-001` and `-004` skip a call to a locally defined `eval`/`exec`. `BAS-ZT4-001` to `-003`
+  skip a prompt the same file sends in the user role.
+- The corpus gate accounts for every finding, enforces each expected finding's kind and severity, and
+  counts known false positives against defect precision.
+
+### Added
+
+- `CveStatus::Partial`: an OSV lookup whose later page or advisory requests failed now reports how
+  many dependencies may have incomplete results, in the terminal, JSON (`"status": "partial"`) and
+  SARIF (a tool-execution warning, also emitted for an unreachable lookup). Exit codes are unchanged.
+- Rule schema: `flow.unproven`, `flow.builtin_callee`, and `none_in_file`.
+- Rule schema: `flow.source` is now optional. A `flow:` clause that omits it does not gate on
+  provenance at all — it matches any value that is not built only from literals this file fixes and
+  (with `flow.unguarded`) not already dominated by a guard, whatever produced it. `flow.unproven` has
+  no effect once every non-closed, non-guarded value is already proven, so a rule fails to load if it
+  declares `flow.unproven` while `flow.source` is omitted. `flow.sink` is rejected the same way when
+  `flow.source` is omitted, since a sourceless wrapper-forwarding search is a materially broader,
+  currently untested reach no shipped rule asks for. This is what `BAS-LLM10-004` now uses; see the
+  `Changed` entry above.
+- **`BAS-LLM10-009`: non-literal command run through a shell, regardless of any allowlist/denylist
+  check.** Flags a `subprocess`/`os.system`/`os.popen` shell call fed a non-literal command even when
+  the surrounding code has an allowlist or denylist gate, since neither actually prevents the shell
+  from receiving attacker-controlled input. Python only for now — no `child_process` (JS/TS) twin
+  ships in this change. Closes a detection gap where a shell call fed a non-literal command was
+  missed whenever an allowlist/denylist check preceded it, even though such a check never actually
+  prevents attacker-controlled input from reaching the shell.
+- **`BAS-LLM10-012`: file opened at an unresolved path built by joining or interpolating a non-literal
+  value.** Flags `open()` calls assembled inline via `os.path.join`/f-string/string concatenation with
+  no `realpath`/`abspath` resolution — including when the only existing guard is a bypassable
+  string-prefix containment check. Python only for now — no JS/TS twin ships in this change. Closes a
+  detection gap where such a path was missed whenever any containment check preceded the `open()`
+  call, even a string-prefix check that does not resolve `..` segments or symlinks.
+- **`BAS-ZT1-018`/`-019`/`-020`: hardcoded JWT literal, hardcoded AWS access key ID, and a
+  credential-shaped default value read from an environment variable.** Three new hardcoded-secret
+  shapes — a JWT literal, an AWS access key ID, and a credential-shaped default argument to an
+  environment-variable lookup — that the existing `ZT1` rules' name-and-value checks did not cover.
+  Python only for now — no JS/TS twin ships in this change.
+- **`BAS-LLM10-017`/`-018`: unparameterized SQL query reaches execution, directly or via a local
+  variable.** Flags an interpolation-built query string that reaches `.execute()` either inline or
+  after first being assigned to a local variable. Closes a detection gap where the query was missed
+  once it was stored in a local variable before being executed, rather than passed to `.execute()`
+  directly. Python only for now — no JS/TS twin ships in this change.
+- **`BAS-LLM01-002`/`-003`: hidden instruction block and suspicious instruction-override phrase in a
+  tool's own description.** Detects MCP "tool poisoning" — an adversarial instruction riding along
+  inside a tool's docstring that a human reviewer approving the tool would never read as an
+  instruction. Closes a gap where a tool's description field was never inspected as a
+  prompt-injection surface at all, even though a host's tool-discovery mechanism reads it directly.
+  Python only for now — no JS/TS twin ships in this change.
+- **`BAS-ZT1-021`/`-022`: a provider API key literal, and any other credential-shaped literal, in a
+  committed `.env` file.** `.env` files were always walked (the walker's own allowlist calls them
+  "exactly the material a scanner should not miss") but no analyser claimed the format, so a real key
+  committed to one produced no finding and was not even recorded as skipped. Reuses the same
+  credential-shape judgment already backing `BAS-INFRA-002`/`-006`
+  (`credential::is_provider_key_literal`, `looks_like_credential_key`,
+  `is_hardcoded_credential_value`). `.env.example`, `.env.sample`, `.env.template`, and `.env.dist`
+  are still analysed, so they count as scanned, but never flagged. Rust-native, like the
+  Dockerfile/Compose checks — no YAML rule file for either id.
+
+### Fixed
+
+- A Compose file that is not valid YAML is listed as skipped instead of counted as scanned.
+- `BAS-LLM10-009` no longer fires on a shell command whose entire non-literal content traces to an
+  unprocessed `sys.stdin` read (`sys.stdin.read()`, `json.load(sys.stdin)`, `input()`) — a hook or
+  skill-runner's own command-dispatch control-channel shape, the same trust boundary as `argv` rather
+  than attacker-reachable input. A command that reaches a shell via any other non-literal path is
+  unaffected.
+- `BAS-LLM10-012`'s `constant_path` check (a file path proven to come only from this file's own
+  location, not from anything a caller supplies) now also recognizes `pathlib.Path` construction and
+  its `.parent`/`.resolve()`/`.absolute()`/`.with_name()`/`.with_suffix()` chain, not just
+  `os.path.*`. A path assembled entirely through `pathlib` starting from `__file__` no longer fires.
+- New `exclude_if: cli_argument` predicate for `BAS-LLM10-009` and `BAS-LLM10-012`: a value traced
+  entirely to `sys.argv`, an `argparse.ArgumentParser`'s own `.parse_args()`/`.parse_known_args()`
+  result, or a `click`/`typer` command's own declared parameter is the operator's own command line,
+  not attacker-reachable input, and no longer fires. A value that also mixes in any other non-literal
+  source is unaffected and still fires.
+- Values from Python's `tempfile` module (`mkdtemp()`, `mkstemp()`, `gettempdir()`, the name bound by
+  `with TemporaryDirectory() as ...`, `NamedTemporaryFile(...).name`) are now recognized as
+  OS-generated and not attacker-influenced, for both `BAS-LLM10-009` and `BAS-LLM10-012` — but only
+  when every argument passed to the call is itself already proven safe; a caller-controlled
+  `prefix`/`suffix`/`dir` argument is unaffected and still fires.
+- `BAS-LLM10-009`: a helper function whose parameter reaches a shell with no processing in between,
+  and which nothing in the file calls from a recognized entry point (an MCP tool, a web-framework
+  route or request handler, a CLI command), is now reported as a low-confidence observation instead
+  of a defect — out of the default report, visible with `--show-observations`. A parameter an entry
+  point forwards into the helper, the entry point itself, or a value this file can trace to another
+  source, is unaffected and still reports a defect.
+
+## [0.1.7] - 2026-09-25
+
+### Fixed
+
+- **`BAS-SKILL-001` required four frontmatter fields; the spec only requires two.** The check
+  previously reported a finding whenever a `SKILL.md`'s frontmatter was missing any of `name`,
+  `description`, `version`, or `permissions`, but the Agent Skills specification only requires
+  `name` and `description` — `version` is not a spec field at all (it is only suggested as a nested
+  key inside an optional `metadata:` block), and `permissions` does not exist in the spec (the
+  nearest thing is an optional, experimental `allowed-tools` field). This meant the rule fired on
+  correctly written `SKILL.md` files that simply didn't declare the two extra fields. It's now a
+  `name`/`description`-only check, filed as a low-severity observation (hidden unless
+  `--show-observations` is passed) rather than a defect, since a spec-validity gap is not itself a
+  security claim.
+
 ## [0.1.6] - 2026-09-22
 
 ### Added
@@ -397,7 +688,18 @@ single point in time. This paragraph prints no number, because it drifts every t
 added. See [Measured coverage](README.md#measured-coverage) for the current count, always derived
 from the gate rather than typed in here.
 
-[Unreleased]: https://github.com/BASTYN-labs/bastyn-scan/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/BASTYN-labs/bastyn-scan/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.8.0
+[0.7.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.7.0
+[0.6.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.6.0
+[0.5.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.5.0
+[0.4.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.4.0
+[0.3.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.3.0
+[0.2.2]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.2.2
+[0.2.1]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.2.1
+[0.2.0]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.2.0
+[0.1.8]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.8
+[0.1.7]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.7
 [0.1.6]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.6
 [0.1.5]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.5
 [0.1.4]: https://github.com/BASTYN-labs/bastyn-scan/releases/tag/v0.1.4

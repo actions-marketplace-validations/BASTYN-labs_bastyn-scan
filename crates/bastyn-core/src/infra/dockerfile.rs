@@ -303,7 +303,7 @@ fn check_key_literals(instructions: &[Instruction], relative_path: &Path) -> Vec
         .flat_map(|instruction| {
             assignments(&instruction.arguments)
                 .into_iter()
-                .filter(|(_, value)| is_provider_key_literal(value))
+                .filter(|(_, value)| credential::is_provider_key_literal(value))
                 .map(move |(name, value)| Finding {
                     rule_id: "BAS-INFRA-002".to_owned(),
                     title: "Provider API key baked into the container image".to_owned(),
@@ -337,10 +337,10 @@ fn check_key_literals(instructions: &[Instruction], relative_path: &Path) -> Vec
 /// The generic sibling of `BAS-INFRA-002`: that rule owns the narrow `sk-`
 /// provider-key shape, this one owns everything else credential-named —
 /// database passwords, service tokens, generic API secrets. A value already
-/// caught by [`is_provider_key_literal`] is excluded here so the two rules
-/// never double-report the same literal. See [`credential`] for the shared
-/// name/value judgment the Compose `environment:` check under the same rule
-/// id reuses.
+/// caught by [`credential::is_provider_key_literal`] is excluded here so the
+/// two rules never double-report the same literal. See [`credential`] for the
+/// shared name/value judgment the Compose `environment:` check under the same
+/// rule id reuses.
 fn check_credential_literals(instructions: &[Instruction], relative_path: &Path) -> Vec<Finding> {
     instructions
         .iter()
@@ -349,14 +349,15 @@ fn check_credential_literals(instructions: &[Instruction], relative_path: &Path)
             assignments(&instruction.arguments)
                 .into_iter()
                 .filter(|(name, value)| {
-                    !is_provider_key_literal(value)
+                    !credential::is_provider_key_literal(value)
                         && credential::looks_like_credential_key(name)
                         && credential::is_hardcoded_credential_value(value)
                 })
                 .map(move |(name, value)| Finding {
                     rule_id: "BAS-INFRA-006".to_owned(),
                     title: "Hardcoded credential in deployment configuration".to_owned(),
-                    kind: Kind::Defect,
+                    // Reported as an observation: the match alone does not show a real problem.
+                    kind: Kind::Observation,
                     severity: credential::credential_severity(&name, &value),
                     confidence: Confidence::High,
                     categories: vec![Category::Zt1],
@@ -452,23 +453,6 @@ fn unquote(value: &str) -> &str {
     trimmed
 }
 
-/// True if `value` has the shape of a provider API key.
-///
-/// This is `BAS-ZT1-003`'s `^sk-[A-Za-z0-9_-]{16,}$` written out, not a second
-/// opinion about what a secret looks like: the same shape decides in a
-/// Dockerfile as in TypeScript source, so one config cannot be a credential in
-/// one file and a harmless string in another. Anchored at both ends, which is
-/// what keeps `sk-tools/bin` — a path that merely starts the same way — out.
-fn is_provider_key_literal(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("sk-") else {
-        return false;
-    };
-    rest.len() >= 16
-        && rest
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-}
-
 fn location(relative_path: &Path, line: usize) -> Location {
     Location {
         file: relative_path.to_path_buf(),
@@ -535,8 +519,14 @@ mod tests {
 
     #[test]
     fn an_empty_file_parses_to_nothing() {
-        assert!(parse("").is_empty());
-        assert!(parse("\n\n   \n# just a comment\n").is_empty());
+        assert_eq!(
+            parse(""),
+            Vec::<crate::infra::dockerfile::Instruction>::new()
+        );
+        assert_eq!(
+            parse("\n\n   \n# just a comment\n"),
+            Vec::<crate::infra::dockerfile::Instruction>::new()
+        );
     }
 
     fn user_of(contents: &str) -> String {
@@ -612,7 +602,7 @@ mod tests {
         // root` in a builder is not a defect, because that stage is discarded.
         let builder_drops_root = "FROM node:22 AS builder\nUSER root\nRUN npm ci\n\nFROM node:22-slim\nCOPY --from=builder /app /app\nUSER app\n";
         assert_eq!(user_of(builder_drops_root), "app");
-        assert!(rules(builder_drops_root).is_empty());
+        assert_eq!(rules(builder_drops_root), Vec::<String>::new());
 
         let builder_only = "FROM node:22 AS builder\nUSER app\nRUN npm ci\n\nFROM node:22-slim\nCOPY --from=builder /app /app\n";
         assert_eq!(user_of(builder_only), "<unset>");
@@ -627,7 +617,7 @@ mod tests {
         // included — so the inherited value is what actually runs.
         let inherits_app = "FROM node:22 AS base\nUSER app\n\nFROM base\nCMD [\"node\"]\n";
         assert_eq!(user_of(inherits_app), "app");
-        assert!(rules(inherits_app).is_empty());
+        assert_eq!(rules(inherits_app), Vec::<String>::new());
 
         let inherits_root = "FROM node:22 AS base\nUSER root\n\nFROM base\nCMD [\"node\"]\n";
         assert_eq!(user_of(inherits_root), "root");
@@ -743,7 +733,13 @@ mod tests {
     fn an_empty_dockerfile_produces_nothing() {
         // A file with no instructions describes no container, so there is no
         // boundary to have an opinion about.
-        assert!(run_all(Path::new("Dockerfile"), "").is_empty());
-        assert!(run_all(Path::new("Dockerfile"), "# notes only\n").is_empty());
+        assert_eq!(
+            run_all(Path::new("Dockerfile"), ""),
+            Vec::<crate::finding::Finding>::new()
+        );
+        assert_eq!(
+            run_all(Path::new("Dockerfile"), "# notes only\n"),
+            Vec::<crate::finding::Finding>::new()
+        );
     }
 }

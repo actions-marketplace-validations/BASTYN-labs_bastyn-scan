@@ -6,7 +6,9 @@ use std::path::Path;
 
 use crate::category::Category;
 use crate::finding::{Confidence, Finding, Kind, Location, Severity};
+use crate::infra::DOCKER_SOCKET;
 
+use super::launch::{launch_commands, pipes_download_into_shell, shell_script};
 use super::model::{McpConfig, ServerEntry};
 
 /// Run every check against every server in `config`, in a fixed order, so
@@ -25,6 +27,8 @@ pub(crate) fn run_all(config: &McpConfig, relative_path: &Path, contents: &str) 
             contents,
         ));
         findings.extend(check_unpinned_server(name, entry, relative_path, contents));
+        findings.extend(check_shell_wrapper(name, entry, relative_path, contents));
+        findings.extend(check_docker_launch(name, entry, relative_path, contents));
         findings.extend(check_unauthenticated_http(
             name,
             entry,
@@ -43,6 +47,7 @@ pub(crate) fn run_all(config: &McpConfig, relative_path: &Path, contents: &str) 
             relative_path,
             contents,
         ));
+        findings.extend(check_secret_in_url(name, entry, relative_path, contents));
         findings.extend(check_auto_approve_wildcard(
             name,
             entry,
@@ -103,6 +108,82 @@ pub(crate) fn locate(contents: &str, needle: &str) -> (usize, String) {
     }
     let first = contents.lines().next().unwrap_or_default();
     (1, first.trim().to_string())
+}
+
+/// The byte offset where server `name`'s entry starts: its JSON key
+/// (`"name":`), its YAML key (`name:`) or its TOML table header
+/// (`[mcp_servers.name]`). `None` when the file does not spell it that way.
+fn entry_start(contents: &str, name: &str) -> Option<usize> {
+    let quoted = format!("\"{name}\"");
+    let mut offset = 0;
+    for line in contents.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let key_follows =
+            |rest: &str| rest.trim_start().starts_with(':') || rest.trim_start().starts_with('=');
+        let found = if let Some(at) = line.find(&quoted) {
+            key_follows(&line[at + quoted.len()..]).then_some(at)
+        } else if let Some(rest) = trimmed.strip_prefix(name) {
+            rest.trim_start().starts_with(':').then_some(indent)
+        } else if trimmed.starts_with('[') {
+            let header = trimmed
+                .trim_end()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            let last = header.rsplit('.').next().unwrap_or_default();
+            (last.trim().trim_matches('"') == name).then_some(indent)
+        } else {
+            None
+        };
+        if let Some(at) = found {
+            return Some(offset + at);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Where server `name`'s entry starts: (1-based line, 1-based column counted in
+/// characters, trimmed text of that line). Falls back to [`locate`]'s line and
+/// column 1 when the file does not spell the entry as a key or table header.
+pub(crate) fn locate_entry(contents: &str, name: &str) -> (usize, usize, String) {
+    if let Some(start) = entry_start(contents, name) {
+        let before = &contents[..start];
+        let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+        let line = before.matches('\n').count() + 1;
+        let column = contents[line_start..start].chars().count() + 1;
+        let text = contents[line_start..].lines().next().unwrap_or_default();
+        return (line, column, text.trim().to_string());
+    }
+    let (line, snippet) = locate(contents, name);
+    (line, 1, snippet)
+}
+
+/// Like [`locate`], but looks only from where server `name`'s entry starts,
+/// so two servers with the same text each get their own line. The first of
+/// `needles` that occurs from there on is used; when none does, or the entry
+/// cannot be found, the search covers the whole file.
+fn locate_in_entry(contents: &str, name: &str, needles: &[&str]) -> (usize, String) {
+    if let Some(start) = entry_start(contents, name) {
+        let first_line = contents[..start].matches('\n').count();
+        for needle in needles.iter().filter(|needle| !needle.is_empty()) {
+            for (index, line) in contents.lines().enumerate().skip(first_line) {
+                if line.contains(needle) {
+                    return (index + 1, line.trim().to_string());
+                }
+            }
+        }
+    }
+    locate(contents, needles.first().copied().unwrap_or_default())
+}
+
+/// The line of server `name`'s bind mount from `source`: the `-v`/`--volume`
+/// form (`source:`), then the `--mount` forms (`src=`, `source=`).
+fn locate_mount(contents: &str, name: &str, source: &str) -> (usize, String) {
+    let volume = format!("{source}:");
+    let src = format!("src={source}");
+    let long_src = format!("source={source}");
+    locate_in_entry(contents, name, &[&volume, &src, &long_src, source])
 }
 
 fn location(relative_path: &Path, line: usize) -> Location {
@@ -179,6 +260,185 @@ fn is_home_directory_root(path: &str) -> bool {
     }
 }
 
+/// What a `docker run` / `podman run` command line asks for.
+#[derive(Default)]
+struct DockerOptions {
+    privileged: bool,
+    host_network: bool,
+    /// Host-side source of every bind mount.
+    mount_sources: Vec<String>,
+}
+
+/// Read the isolation-relevant options from the arguments after `run`.
+///
+/// Every argument after `run` is examined, including ones after the image
+/// name. An argument such as `--privileged` that belongs to the container's
+/// own command line would be misread, which is accepted: it is rare, and the
+/// opposite choice (guessing where the image name ends from a hand-kept list
+/// of value-taking flags) would silently miss real flags.
+fn docker_options(args: &[String]) -> DockerOptions {
+    let mut options = DockerOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let next = args.get(index + 1).map(String::as_str);
+        match arg {
+            "--privileged" | "--privileged=true" => options.privileged = true,
+            "--network" | "--net" if next == Some("host") => options.host_network = true,
+            "--network=host" | "--net=host" => options.host_network = true,
+            "-v" | "--volume" => {
+                if let Some(volume) = next {
+                    options.mount_sources.push(volume_source(volume));
+                }
+            }
+            "--mount" => {
+                if let Some(spec) = next {
+                    options.mount_sources.extend(mount_source(spec));
+                }
+            }
+            _ => {
+                if let Some(volume) = arg.strip_prefix("--volume=") {
+                    options.mount_sources.push(volume_source(volume));
+                } else if let Some(spec) = arg.strip_prefix("--mount=") {
+                    options.mount_sources.extend(mount_source(spec));
+                }
+            }
+        }
+        index += 1;
+    }
+    options
+}
+
+/// The host-side part of a `-v source:target[:mode]` value.
+fn volume_source(volume: &str) -> String {
+    volume.split(':').next().unwrap_or_default().to_owned()
+}
+
+/// The `src=` / `source=` value of a `--mount` spec.
+fn mount_source(spec: &str) -> Option<String> {
+    spec.split(',').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        matches!(key.trim(), "src" | "source").then(|| value.trim().to_owned())
+    })
+}
+
+/// `BAS-MCP-001` (bind mounts), `BAS-MCP-007` and `BAS-MCP-008`: what a
+/// container launcher asks of the host.
+///
+/// A root or home bind mount is the container form of the broad filesystem
+/// grant `BAS-MCP-001` already reports. `--privileged` and the Docker socket
+/// are the same evidence the Compose checks `BAS-INFRA-003`/`-004` use.
+/// Host networking is an observation, as `BAS-INFRA-005` is: it is how many
+/// legitimate sidecars run, and the repository cannot show it is wrong here.
+fn check_docker_launch(
+    name: &str,
+    entry: &ServerEntry,
+    relative_path: &Path,
+    contents: &str,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for command in launch_commands(entry) {
+        if !matches!(command.program.as_str(), "docker" | "podman" | "nerdctl") {
+            continue;
+        }
+        let Some(run_at) = command.args.iter().position(|arg| arg == "run") else {
+            continue;
+        };
+        let options = docker_options(&command.args[run_at + 1..]);
+
+        if let Some(source) = options
+            .mount_sources
+            .iter()
+            .find(|source| is_broad_filesystem_path(source))
+        {
+            let (line, snippet) = locate_mount(contents, name, source);
+            findings.push(Finding {
+                rule_id: "BAS-MCP-001".to_string(),
+                title: "MCP server granted root or broad filesystem access".to_string(),
+                kind: Kind::Defect,
+                severity: Severity::High,
+                confidence: Confidence::High,
+                categories: vec![Category::Zt3],
+                location: location(relative_path, line),
+                snippet,
+                description: format!(
+                    "Server `{name}` runs a container with `{source}` bind-mounted from the host, \
+                     granting it the filesystem root or an entire home directory rather than a \
+                     scoped path."
+                ),
+                remediation: "Mount only the narrowest directory the server needs, read-only \
+                     where possible."
+                    .to_string(),
+                secondary_rule_ids: Vec::new(),
+                references: Vec::new(),
+            });
+        }
+
+        let socket = options
+            .mount_sources
+            .iter()
+            .any(|source| source == DOCKER_SOCKET || source == "/run/docker.sock");
+        if options.privileged || socket {
+            let (needle, what) = if options.privileged {
+                (
+                    "--privileged",
+                    "`--privileged`, which removes the container's capability, seccomp and \
+                     device restrictions",
+                )
+            } else {
+                (
+                    "docker.sock",
+                    "the Docker socket, which is full control of the Docker daemon",
+                )
+            };
+            let (line, snippet) = locate_in_entry(contents, name, &[needle]);
+            findings.push(Finding {
+                rule_id: "BAS-MCP-007".to_string(),
+                title: "MCP server container escapes its isolation".to_string(),
+                kind: Kind::Defect,
+                severity: Severity::High,
+                confidence: Confidence::High,
+                categories: vec![Category::Zt3],
+                location: location(relative_path, line),
+                snippet,
+                description: format!(
+                    "Server `{name}` is launched with {what}. Anything the server runs, including \
+                     a tool an agent chooses to call, can reach the host."
+                ),
+                remediation: "Drop the option. Grant a specific capability or device instead, or \
+                     put a scoped proxy in front of the daemon."
+                    .to_string(),
+                secondary_rule_ids: Vec::new(),
+                references: Vec::new(),
+            });
+        }
+
+        if options.host_network {
+            let (line, snippet) = locate_in_entry(contents, name, &["--net"]);
+            findings.push(Finding {
+                rule_id: "BAS-MCP-008".to_string(),
+                title: "MCP server container shares the host network".to_string(),
+                kind: Kind::Observation,
+                severity: Severity::Medium,
+                confidence: Confidence::High,
+                categories: vec![Category::Zt3],
+                location: location(relative_path, line),
+                snippet,
+                description: format!(
+                    "Server `{name}` runs a container on the host network namespace, so it can \
+                     reach services bound to the host's loopback interface."
+                ),
+                remediation: "Use a bridge network and publish only the ports the server needs, \
+                     unless host networking is required."
+                    .to_string(),
+                secondary_rule_ids: Vec::new(),
+                references: Vec::new(),
+            });
+        }
+    }
+    findings
+}
+
 /// `BAS-MCP-002` — an MCP server reached over unauthenticated plaintext
 /// HTTP.
 ///
@@ -236,7 +496,8 @@ fn check_unauthenticated_http(
     Some(Finding {
         rule_id: "BAS-MCP-002".to_string(),
         title: "MCP server reached over unauthenticated plaintext HTTP".to_string(),
-        kind: Kind::Defect,
+        // Reported as an observation: the match alone does not show a real problem.
+        kind: Kind::Observation,
         severity: Severity::High,
         confidence: Confidence::Medium,
         categories: vec![Category::Zt1],
@@ -307,7 +568,8 @@ fn check_unpinned_server(
     vec![Finding {
         rule_id: "BAS-MCP-005".to_string(),
         title: format!("MCP server '{name}' is launched without a version pin"),
-        kind: Kind::Defect,
+        // Reported as an observation: the match alone does not show a real problem.
+        kind: Kind::Observation,
         severity: Severity::High,
         confidence: Confidence::High,
         categories: vec![Category::Llm04],
@@ -325,6 +587,74 @@ fn check_unpinned_server(
         secondary_rule_ids: Vec::new(),
         references: Vec::new(),
     }]
+}
+
+/// `BAS-MCP-006` - a shell wrapper that downloads code and runs it, plus the
+/// root-path and version-pin checks applied to a registry launcher inside
+/// the wrapper.
+///
+/// A wrapper on its own reports nothing: `sh -c "exec node server.js"` is the
+/// repository owner's own launcher. What is reported is what the script does
+/// that the manifest checks would otherwise miss: code fetched at launch with
+/// no pin, and `npx -y pkg /` hidden behind `sh -c`.
+fn check_shell_wrapper(
+    name: &str,
+    entry: &ServerEntry,
+    relative_path: &Path,
+    contents: &str,
+) -> Vec<Finding> {
+    let Some(script) = shell_script(entry) else {
+        return Vec::new();
+    };
+    let mut findings = Vec::new();
+
+    if pipes_download_into_shell(&script) {
+        let (line, snippet) = locate(contents, &script);
+        findings.push(Finding {
+            rule_id: "BAS-MCP-006".to_string(),
+            title: "MCP server launcher downloads and runs code".to_string(),
+            kind: Kind::Defect,
+            severity: Severity::High,
+            confidence: Confidence::High,
+            categories: vec![Category::Llm04],
+            location: location(relative_path, line),
+            snippet,
+            description: format!(
+                "Server `{name}` is launched through a shell script that downloads content and \
+                 pipes it into a shell. What runs is whatever the remote address serves when the \
+                 agent starts, with no pin and no change to this repository."
+            ),
+            remediation: "Install a pinned, checksummed release ahead of time and launch it \
+                 directly, instead of fetching and running code at startup."
+                .to_string(),
+            secondary_rule_ids: Vec::new(),
+            references: Vec::new(),
+        });
+    }
+
+    for inner in launch_commands(entry).into_iter().skip(1) {
+        if !matches!(inner.program.as_str(), "npx" | "uvx" | "pnpx" | "bunx") {
+            continue;
+        }
+        let synthetic = ServerEntry {
+            command: Some(inner.program),
+            args: inner.args,
+            ..ServerEntry::default()
+        };
+        findings.extend(check_broad_filesystem_access(
+            name,
+            &synthetic,
+            relative_path,
+            contents,
+        ));
+        findings.extend(check_unpinned_server(
+            name,
+            &synthetic,
+            relative_path,
+            contents,
+        ));
+    }
+    findings
 }
 
 /// True if `package` carries an explicit version.
@@ -550,6 +880,53 @@ fn check_hardcoded_credentials(
         .collect()
 }
 
+/// `BAS-MCP-009` — a literal credential in the query string of a server URL.
+///
+/// The URL is committed to the repository and sent with every request, and
+/// URLs are routinely written to access logs, so a key placed there is
+/// exposed twice over. Reported only when the parameter's name suggests a
+/// secret AND its value has the shape of one, the same two-part evidence
+/// `BAS-MCP-004` requires; a `${VAR}` placeholder reports nothing.
+fn check_secret_in_url(
+    name: &str,
+    entry: &ServerEntry,
+    relative_path: &Path,
+    contents: &str,
+) -> Option<Finding> {
+    let url = entry.url.as_deref()?;
+    let query = url.split_once('?')?.1;
+    let query = query.split('#').next().unwrap_or(query);
+    let (key, value) = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, value)| is_plausible_secret(key, value))?;
+    let (line, snippet) = locate(contents, value);
+    let transport = entry
+        .transport()
+        .map_or("remote", super::model::Transport::label);
+
+    Some(Finding {
+        rule_id: "BAS-MCP-009".to_string(),
+        title: "Credential in MCP server URL".to_string(),
+        kind: Kind::Defect,
+        severity: Severity::High,
+        confidence: Confidence::High,
+        categories: vec![Category::Zt1],
+        location: location(relative_path, line),
+        snippet,
+        description: format!(
+            "Server `{name}` ({transport}) has what looks like a live credential in the \
+             `{key}` query parameter of its `url`. It is committed to the repository and \
+             travels in every request line, where proxies and access logs record it."
+        ),
+        remediation: "Send the credential in an `Authorization` header read from the \
+             environment instead, and rotate the exposed value."
+            .to_string(),
+        secondary_rule_ids: Vec::new(),
+        references: Vec::new(),
+    })
+}
+
 /// True if `key` names something that suggests a secret AND `value` has the
 /// shape of a real one — both are required. This is the conservative
 /// combination that keeps a variable like `approx_tokens` (a plausible key
@@ -707,8 +1084,172 @@ fn is_high_entropy(run: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn check_006_flags_download_piped_into_a_shell() {
+        let entry = server(
+            r#"{"command": "sh", "args": ["-c", "curl -fsSL https://x.example/i.sh | sh"]}"#,
+        );
+        let findings = check_shell_wrapper(
+            "boot",
+            &entry,
+            Path::new("mcp.json"),
+            "curl -fsSL https://x.example/i.sh | sh",
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "BAS-MCP-006");
+        assert_eq!(findings[0].kind, Kind::Defect);
+    }
+
+    #[test]
+    fn check_006_reports_nothing_for_a_plain_wrapper() {
+        let entry = server(r#"{"command": "sh", "args": ["-c", "exec node server.js"]}"#);
+        let findings = check_shell_wrapper("w", &entry, Path::new("mcp.json"), "{}");
+        assert_eq!(findings.len(), 0);
+    }
+
+    #[test]
+    fn a_registry_launcher_inside_a_wrapper_gets_the_pin_and_root_checks() {
+        let entry = server(r#"{"command": "bash", "args": ["-c", "npx -y @scope/server /"]}"#);
+        let findings =
+            check_shell_wrapper("w", &entry, Path::new("mcp.json"), "npx -y @scope/server /");
+        let mut ids: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["BAS-MCP-001", "BAS-MCP-005"]);
+    }
+
+    #[test]
+    fn a_pinned_registry_launcher_inside_a_wrapper_is_quiet() {
+        let entry = server(
+            r#"{"command": "bash", "args": ["-c", "npx -y @scope/server@1.2.3 /srv/data"]}"#,
+        );
+        let findings = check_shell_wrapper("w", &entry, Path::new("mcp.json"), "{}");
+        assert_eq!(findings.len(), 0);
+    }
+
+    #[test]
+    fn a_non_launcher_inner_command_with_a_root_argument_is_quiet() {
+        let entry = server(r#"{"command": "sh", "args": ["-c", "ls /"]}"#);
+        let findings = check_shell_wrapper("w", &entry, Path::new("mcp.json"), "{}");
+        assert_eq!(findings.len(), 0);
+    }
+
     fn server(json: &str) -> ServerEntry {
         serde_json::from_str(json).unwrap()
+    }
+
+    fn docker(args: &str) -> ServerEntry {
+        server(&format!(r#"{{"command": "docker", "args": {args}}}"#))
+    }
+
+    fn ids(findings: &[Finding]) -> Vec<&str> {
+        findings.iter().map(|f| f.rule_id.as_str()).collect()
+    }
+
+    #[test]
+    fn an_entry_is_found_by_its_json_yaml_or_toml_key() {
+        let json = "{\n  \"mcpServers\": {\n    \"a\": {\"command\": \"docker\"},\n    \"docker\": {}\n  }\n}";
+        let at = entry_start(json, "docker").unwrap();
+        assert_eq!(json[..at].matches('\n').count(), 3);
+        let yaml = "mcpServers:\n  a:\n    command: docker\n  docker:\n    args: []\n";
+        let at = entry_start(yaml, "docker").unwrap();
+        assert_eq!(yaml[..at].matches('\n').count(), 3);
+        let toml = "[mcp_servers.a]\ncommand = \"docker\"\n[mcp_servers.docker]\nargs = []\n";
+        let at = entry_start(toml, "docker").unwrap();
+        assert_eq!(toml[..at].matches('\n').count(), 2);
+        assert!(entry_start("{}", "docker").is_none());
+    }
+
+    #[test]
+    fn check_007_flags_privileged_and_the_docker_socket() {
+        let privileged = docker(r#"["run", "--rm", "-i", "--privileged", "img@sha256:1"]"#);
+        assert_eq!(
+            ids(&check_docker_launch(
+                "d",
+                &privileged,
+                Path::new("mcp.json"),
+                "--privileged"
+            )),
+            ["BAS-MCP-007"]
+        );
+        let sock =
+            docker(r#"["run", "-v", "/var/run/docker.sock:/var/run/docker.sock", "img@sha256:1"]"#);
+        assert_eq!(
+            ids(&check_docker_launch(
+                "d",
+                &sock,
+                Path::new("mcp.json"),
+                "docker.sock"
+            )),
+            ["BAS-MCP-007"]
+        );
+        let sock_mount = docker(
+            r#"["run", "--mount", "type=bind,src=/var/run/docker.sock,dst=/s", "img@sha256:1"]"#,
+        );
+        assert_eq!(
+            ids(&check_docker_launch(
+                "d",
+                &sock_mount,
+                Path::new("mcp.json"),
+                "docker.sock"
+            )),
+            ["BAS-MCP-007"]
+        );
+    }
+
+    #[test]
+    fn check_001_extension_flags_a_root_or_home_bind_mount() {
+        for args in [
+            r#"["run", "-v", "/:/host", "img@sha256:1"]"#,
+            r#"["run", "--volume=/home/alice:/h", "img@sha256:1"]"#,
+            r#"["run", "--mount", "type=bind,source=$HOME,target=/h", "img@sha256:1"]"#,
+        ] {
+            let findings = check_docker_launch("d", &docker(args), Path::new("mcp.json"), "{}");
+            assert_eq!(ids(&findings), ["BAS-MCP-001"], "{args}");
+        }
+    }
+
+    #[test]
+    fn check_008_flags_host_network_as_an_observation() {
+        for args in [
+            r#"["run", "--network", "host", "img@sha256:1"]"#,
+            r#"["run", "--net=host", "img@sha256:1"]"#,
+        ] {
+            let findings =
+                check_docker_launch("d", &docker(args), Path::new("mcp.json"), "--network");
+            assert_eq!(ids(&findings), ["BAS-MCP-008"], "{args}");
+            assert_eq!(findings[0].kind, Kind::Observation);
+        }
+    }
+
+    #[test]
+    fn docker_near_misses_are_quiet() {
+        for args in [
+            r#"["run", "--rm", "-i", "-v", "/srv/data:/data", "img@sha256:1"]"#,
+            r#"["run", "--network=bridge", "img@sha256:1"]"#,
+            r#"["run", "--privileged=false", "img@sha256:1"]"#,
+            r#"["ps"]"#,
+        ] {
+            assert!(
+                check_docker_launch("d", &docker(args), Path::new("mcp.json"), "{}").is_empty(),
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_inside_a_shell_wrapper_is_still_seen() {
+        let entry = server(
+            r#"{"command": "sh", "args": ["-c", "docker run --rm -i --privileged img@sha256:1"]}"#,
+        );
+        assert_eq!(
+            ids(&check_docker_launch(
+                "d",
+                &entry,
+                Path::new("mcp.json"),
+                "--privileged"
+            )),
+            ["BAS-MCP-007"]
+        );
     }
 
     #[test]
@@ -751,7 +1292,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(finding.rule_id, "BAS-MCP-002");
-        assert_eq!(finding.kind, Kind::Defect);
+        assert_eq!(finding.kind, Kind::Observation);
     }
 
     #[test]
@@ -976,5 +1517,85 @@ mod tests {
         );
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, "BAS-LLM03-020");
+    }
+
+    #[test]
+    fn check_009_flags_a_literal_secret_in_a_query_parameter() {
+        let json = r#"{"url": "https://m.example.com/mcp?api_key=sk-live-abc123def456ghi789jkl"}"#;
+        let entry = server(json);
+        let finding = check_secret_in_url("m", &entry, Path::new("mcp.json"), json).unwrap();
+        assert_eq!(finding.rule_id, "BAS-MCP-009");
+        assert_eq!(finding.kind, Kind::Defect);
+        assert!(
+            !finding.description.contains("sk-live"),
+            "must not echo the secret"
+        );
+        assert!(finding.description.contains("api_key"));
+    }
+
+    #[test]
+    fn check_009_walks_past_placeholders_and_ordinary_parameters() {
+        for url in [
+            "https://m.example.com/mcp?api_key=${METRICS_API_KEY}",
+            "https://m.example.com/mcp?token=YOUR_TOKEN",
+            "https://m.example.com/mcp?region=eu-west-1&page=2",
+            "https://m.example.com/mcp",
+        ] {
+            let entry = server(&format!(r#"{{"url": "{url}"}}"#));
+            assert!(
+                check_secret_in_url("m", &entry, Path::new("mcp.json"), "{}").is_none(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_009_ignores_a_stdio_entry() {
+        // A stdio entry has no wire URL; an argument that looks like one is not this finding.
+        let entry = server(r#"{"command": "node", "args": ["s.js"], "env": {}}"#);
+        assert!(check_secret_in_url("m", &entry, Path::new("mcp.json"), "{}").is_none());
+    }
+
+    #[test]
+    fn locate_entry_finds_a_pretty_printed_json_key() {
+        let contents = "{\n  \"mcpServers\": {\n    \"a\": {\"url\": \"https://x\"}\n  }\n}\n";
+        let (line, column, snippet) = locate_entry(contents, "a");
+        assert_eq!((line, column), (3, 5));
+        assert_eq!(snippet, "\"a\": {\"url\": \"https://x\"}");
+    }
+
+    #[test]
+    fn locate_entry_separates_two_servers_on_one_minified_line() {
+        let contents = r#"{"mcpServers":{"a":{"url":"https://a"},"b":{"url":"https://b"}}}"#;
+        let (line_a, column_a, _) = locate_entry(contents, "a");
+        let (line_b, column_b, _) = locate_entry(contents, "b");
+        assert_eq!((line_a, line_b), (1, 1));
+        assert!(column_a > 1 && column_b > column_a, "{column_a} {column_b}");
+    }
+
+    #[test]
+    fn locate_entry_finds_yaml_and_toml_entries() {
+        let yaml = "servers:\n  remote:\n    url: https://x\n";
+        assert_eq!(locate_entry(yaml, "remote").0, 2);
+        assert_eq!(locate_entry(yaml, "remote").1, 3);
+        let toml = "[mcp_servers.remote]\nurl = \"https://x\"\n";
+        let (line, column, snippet) = locate_entry(toml, "remote");
+        assert_eq!((line, column), (1, 1));
+        assert_eq!(snippet, "[mcp_servers.remote]");
+    }
+
+    #[test]
+    fn locate_entry_prefers_the_real_key_over_a_substring_of_another() {
+        let contents = "{\n  \"mcpServers\": {\n    \"mcp\": {\"url\": \"https://x\"}\n  }\n}\n";
+        let (line, column, _) = locate_entry(contents, "mcp");
+        assert_eq!((line, column), (3, 5));
+    }
+
+    #[test]
+    fn locate_entry_falls_back_to_the_first_match_or_the_first_line() {
+        let contents = "{\n  \"mcpServers\": {}\n}\n";
+        assert_eq!(locate_entry(contents, "mcp").0, 2);
+        assert_eq!(locate_entry(contents, "mcp").1, 1);
+        assert_eq!(locate_entry(contents, "absent"), (1, 1, "{".to_string()));
     }
 }

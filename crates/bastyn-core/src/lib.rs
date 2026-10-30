@@ -13,19 +13,26 @@ pub mod compliance;
 pub mod cve;
 pub mod finding;
 pub mod infra;
+pub mod inspect;
 pub mod instructions;
 pub mod mcp;
 pub mod observe;
 pub mod render;
 pub mod report;
+pub mod reporting;
 pub mod rules;
 pub mod scan;
 pub mod skill;
 
 mod credential;
+mod dotenv;
 mod error;
 pub(crate) mod flow;
 mod generated;
+mod provider_token;
+mod skill_install;
+mod skill_lure;
+mod skill_prose;
 mod test_path;
 mod walk;
 
@@ -34,7 +41,7 @@ pub use compliance::{Control, Crosswalk, Framework, Group, crosswalk};
 pub use error::{Error, Result};
 pub use finding::{Confidence, Finding, Kind, Location, Severity};
 pub use observe::{Observer, Phase, Silent};
-pub use report::{CveStatus, Report, Summary};
+pub use report::{Coverage, CoveredSkip, CveStatus, RemoteServer, RemoteStatus, Report, Summary};
 pub use scan::{ScanOptions, scan, scan_observed};
 pub use walk::{Traversal, WalkOptions, collect_files};
 

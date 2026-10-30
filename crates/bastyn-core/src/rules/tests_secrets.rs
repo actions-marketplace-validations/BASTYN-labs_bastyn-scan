@@ -268,6 +268,32 @@ fn bas_zt1_010_ignores_a_self_referential_storage_key_name() {
 }
 
 #[test]
+fn bas_zt1_010_ignores_a_plain_url_but_flags_one_with_embedded_credentials() {
+    let ruleset = ruleset();
+
+    for source in [
+        "info[\"token_uri\"] = \"https://oauth2.provider.invalid/token\"\n",
+        "TOKEN_URI = \"https://oauth2.provider.invalid/token\"\n",
+        "config = {\"secret_manager_url\": \"https://secrets.provider.invalid/v1/resolve\"}\n",
+    ] {
+        let findings = scan_source(&ruleset, Path::new("auth.py"), source);
+        assert!(
+            !ids(&findings).contains(&"BAS-ZT1-010"),
+            "{source}: {findings:?}"
+        );
+    }
+
+    let source = "database_password_url = \"https://Zx9fQ2mLp4Rt8Vw3@db.provider.invalid/main\"\n";
+    let findings = scan_source(&ruleset, Path::new("auth.py"), source);
+    assert!(ids(&findings).contains(&"BAS-ZT1-010"), "{findings:?}");
+
+    let source =
+        "api_token_url = \"https://api.provider.invalid/v1/hook?api_key=Zx9fQ2mLp4Rt8Vw3Kd7\"\n";
+    let findings = scan_source(&ruleset, Path::new("auth.py"), source);
+    assert!(ids(&findings).contains(&"BAS-ZT1-010"), "{findings:?}");
+}
+
+#[test]
 fn bas_zt1_010_ignores_an_nlp_format_token_not_an_auth_token() {
     // "token" is exceptionally overloaded in an AI codebase: a
     // tokenization/format-string sense has nothing to do with
@@ -532,4 +558,44 @@ fn generic_credential_rule_agrees_with_credential_module_on_placeholders() {
             "rule should agree {value} is a real credential: {findings:?}"
         );
     }
+}
+
+#[test]
+fn bas_zt1_003_ignores_dummy_values_that_say_they_are_secret_or_leaks() {
+    let ruleset = ruleset();
+    for source in [
+        "process.env[\"AGENT_API_KEY\"] = \"sk-supersecret-DO-NOT-LEAK\";\n",
+        "process.env[\"AGENT\"] = \"sk-ant-api03-THIS-IS-A-LONG-SECRET-LOOKING-VALUE-xyz\";\n",
+    ] {
+        let findings = scan_source(&ruleset, Path::new("src/agent.test.ts"), source);
+        assert!(
+            !ids(&findings).contains(&"BAS-ZT1-003"),
+            "{source}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn bas_zt1_003_still_flags_a_random_looking_provider_key() {
+    let ruleset = ruleset();
+    let source = "const key = \"sk-proj-7Hq2LmZx9TrVb4Nc8WdYe3Ka\";\n";
+    let findings = scan_source(&ruleset, Path::new("src/client.ts"), source);
+    assert!(ids(&findings).contains(&"BAS-ZT1-003"), "{findings:?}");
+}
+
+#[test]
+fn bas_zt1_011_ignores_a_reserved_prefix_cookie_name() {
+    let ruleset = ruleset();
+    let source = "const ACCESS_TOKEN_COOKIE = \"__Host-app-dashboard-token\";\n\
+                  const SESSION_SECRET_COOKIE = \"__Secure-app-session-secret\";\n";
+    let findings = scan_source(&ruleset, Path::new("src/routes.ts"), source);
+    assert!(!ids(&findings).contains(&"BAS-ZT1-011"), "{findings:?}");
+}
+
+#[test]
+fn bas_zt1_011_still_flags_a_passphrase_shaped_password() {
+    let ruleset = ruleset();
+    let source = "const password = \"Correct-Horse-Battery-9\";\n";
+    let findings = scan_source(&ruleset, Path::new("src/db.ts"), source);
+    assert!(ids(&findings).contains(&"BAS-ZT1-011"), "{findings:?}");
 }

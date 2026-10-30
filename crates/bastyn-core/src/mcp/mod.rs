@@ -12,15 +12,27 @@
 //! | Rule | What it flags | Category |
 //! | --- | --- | --- |
 //! | `BAS-MCP-000` | The file is not valid JSON/YAML/TOML | `ZT3` |
-//! | `BAS-MCP-001` | A server's `args` grants root or a home directory | `ZT3` |
+//! | `BAS-MCP-001` | A server's `args`, or a container bind mount, grants root or a home directory | `ZT3` |
 //! | `BAS-MCP-002` | A `url` server reached over unauthenticated `http://` | `ZT1` |
 //! | `BAS-MCP-003` | A `tools`/`permissions`/`allowedTools` wildcard grant | `ZT2` |
 //! | `BAS-MCP-004` | An `env` value shaped like a live credential | `ZT1` |
 //! | `BAS-MCP-005` | A server launched from a registry with no version pin | `LLM04` |
+//! | `BAS-MCP-006` | A shell wrapper that downloads and runs code; registry launchers inside a wrapper get -001/-005 | `LLM04` |
+//! | `BAS-MCP-007` | A container launcher run with `--privileged` or the Docker socket mounted | `ZT3` |
+//! | `BAS-MCP-008` | A container launcher on the host network (observation) | `ZT3` |
+//! | `BAS-MCP-009` | A literal credential in a server `url` query string | `ZT1` |
+//! | `BAS-MCP-010` | Hidden Unicode in a tool's text, in a tools snapshot file | `LLM01` |
+//! | `BAS-MCP-011` | A hidden-instruction marker in a tool description, in a tools snapshot file | `LLM01` |
+//! | `BAS-MCP-012` | An instruction-override phrase in a tool description, in a tools snapshot file (observation) | `LLM01` |
 //! | `BAS-LLM03-020` | A client-wide or per-server `autoApprove`/`alwaysAllow` wildcard | `LLM03` |
 
 pub(crate) mod checks;
-mod model;
+mod launch;
+pub(crate) mod model;
+mod snapshot_checks;
+
+pub(crate) use snapshot_checks::check_snapshot_at;
+pub use snapshot_checks::{inspect_snapshot, is_tools_snapshot};
 
 use std::path::Path;
 
@@ -72,15 +84,69 @@ pub fn is_mcp_config(path: &Path) -> bool {
 /// in hand — so it always returns `Ok`. The `Result` return type is kept so
 /// a future caller-side failure mode does not require an API change.
 pub fn inspect(relative_path: &Path, contents: &str) -> Result<Vec<Finding>> {
+    Ok(inspect_config(relative_path, contents).0)
+}
+
+/// As [`inspect`], and also says whether the config parsed.
+///
+/// The boolean is `true` when the contents parsed as the format the path's
+/// extension names, and `false` when the only finding is the `BAS-MCP-000`
+/// malformed-config defect. The parse happens once, so a caller that needs
+/// both the findings and the verdict does not parse twice.
+#[must_use]
+pub fn inspect_config(relative_path: &Path, contents: &str) -> (Vec<Finding>, bool) {
     let format = model::Format::detect(relative_path);
     match model::parse(format, contents) {
-        Ok(config) => Ok(checks::run_all(&config, relative_path, contents)),
-        Err(reason) => Ok(vec![checks::malformed_finding(
-            relative_path,
-            contents,
-            &reason,
-        )]),
+        Ok(config) => (checks::run_all(&config, relative_path, contents), true),
+        Err(reason) => (
+            vec![checks::malformed_finding(relative_path, contents, &reason)],
+            false,
+        ),
     }
+}
+
+/// Pick one server entry out of a config file's text.
+///
+/// `relative_path` selects the parser by its extension.
+///
+/// # Errors
+///
+/// Returns a message when the contents do not parse, or when no server has
+/// that name; the second message lists the names that exist.
+pub(crate) fn load_server(
+    relative_path: &Path,
+    contents: &str,
+    name: &str,
+) -> std::result::Result<model::ServerEntry, String> {
+    let mut config = model::parse(model::Format::detect(relative_path), contents)
+        .map_err(|reason| format!("could not parse {}: {reason}", relative_path.display()))?;
+    if let Some(entry) = config.mcp_servers.remove(name) {
+        return Ok(entry);
+    }
+    let mut available: Vec<&str> = config.mcp_servers.keys().map(String::as_str).collect();
+    available.sort_unstable();
+    Err(format!(
+        "no server named {name}; available: {}",
+        if available.is_empty() {
+            "none".to_owned()
+        } else {
+            available.join(", ")
+        }
+    ))
+}
+
+/// Every server entry of a config file, sorted by name. A config that does
+/// not parse yields no entries.
+pub(crate) fn server_entries(
+    relative_path: &Path,
+    contents: &str,
+) -> Vec<(String, model::ServerEntry)> {
+    let Ok(config) = model::parse(model::Format::detect(relative_path), contents) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(String, model::ServerEntry)> = config.mcp_servers.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
 }
 
 #[cfg(test)]
@@ -115,21 +181,30 @@ mod dependency_tests {
         // Nothing to query, and BAS-MCP-005 already reports it.
         let config = r#"{"mcpServers":{"fs":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/"]}}}"#;
 
-        assert!(server_dependencies(Path::new("mcp.json"), config).is_empty());
+        assert_eq!(
+            server_dependencies(Path::new("mcp.json"), config),
+            Vec::<crate::cve::Dependency>::new()
+        );
     }
 
     #[test]
     fn a_local_interpreter_yields_no_dependency() {
         let config = r#"{"mcpServers":{"own":{"command":"python","args":["-m","our_server"]}}}"#;
 
-        assert!(server_dependencies(Path::new("mcp.json"), config).is_empty());
+        assert_eq!(
+            server_dependencies(Path::new("mcp.json"), config),
+            Vec::<crate::cve::Dependency>::new()
+        );
     }
 
     #[test]
     fn a_malformed_config_yields_no_dependency_rather_than_panicking() {
         // inspect() already reports the malformed file; reporting it twice
         // would be worse than reporting it once.
-        assert!(server_dependencies(Path::new("mcp.json"), "{ not json").is_empty());
+        assert_eq!(
+            server_dependencies(Path::new("mcp.json"), "{ not json"),
+            Vec::<crate::cve::Dependency>::new()
+        );
     }
 
     #[test]
@@ -187,7 +262,7 @@ mod tests {
     #[test]
     fn empty_config_produces_no_findings() {
         let findings = inspect(Path::new("mcp.json"), r#"{"mcpServers": {}}"#).unwrap();
-        assert!(findings.is_empty());
+        assert_eq!(findings, Vec::<crate::finding::Finding>::new());
     }
 
     /// The headline test: one logical config, expressed in JSON, YAML and
@@ -280,6 +355,20 @@ headers = {}
             "this config is vulnerable on five independent axes, including an \
              unpinned registry launch"
         );
+    }
+
+    /// One server with a secret in its URL query, written in all three
+    /// formats, must produce exactly `BAS-MCP-009`.
+    #[test]
+    fn url_secret_in_json_yaml_toml_produces_the_same_finding() {
+        let json = r#"{"mcpServers": {"m": {"url": "https://m.example.com/mcp?api_key=sk-live-abc123def456ghi789jkl"}}}"#;
+        let yaml = "mcpServers:\n  m:\n    url: https://m.example.com/mcp?api_key=sk-live-abc123def456ghi789jkl\n";
+        let toml = "[mcpServers.m]\nurl = \"https://m.example.com/mcp?api_key=sk-live-abc123def456ghi789jkl\"\n";
+        for (file, text) in [("mcp.json", json), ("mcp.yaml", yaml), ("mcp.toml", toml)] {
+            let findings = inspect(Path::new(file), text).unwrap();
+            let ids: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+            assert_eq!(ids, ["BAS-MCP-009"], "{file}: {findings:#?}");
+        }
     }
 }
 

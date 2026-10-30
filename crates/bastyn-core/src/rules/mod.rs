@@ -47,6 +47,8 @@ mod schema;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_exclude_if;
+#[cfg(test)]
 mod tests_flow;
 
 #[cfg(test)]
@@ -57,6 +59,9 @@ mod tests_memory;
 
 #[cfg(test)]
 mod tests_secrets;
+
+#[cfg(test)]
+mod tests_supply_chain;
 
 pub(crate) use engine::SourceLanguage;
 pub use engine::{RuleSet, ScanOutcome, scan_source, scan_source_checked};

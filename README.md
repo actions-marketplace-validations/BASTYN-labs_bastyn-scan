@@ -12,14 +12,18 @@
   <a href="https://github.com/BASTYN-labs/bastyn-scan/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BASTYN-labs/bastyn-scan/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <a href="https://github.com/BASTYN-labs/bastyn-scan/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/BASTYN-labs/bastyn-scan?sort=semver&display_name=tag"></a>
-  <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.88%2B-orange.svg">
+  <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.90%2B-orange.svg">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg">
   <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg"></a>
 </p>
 
+<p align="center">
+  <img alt="A terminal running bastyn scan on a folder, then scrolling back through the report to a SKILL.md finding, an MCP finding and dependency CVEs" src="docs/demo/demo.gif" width="860">
+</p>
+
 ---
 
-> **Status: alpha.** `bastyn scan` finds real issues today: 44 AST rules over Python, TypeScript and JavaScript across the OWASP GenAI and Anthropic Zero Trust categories, plus MCP manifest inspection, Dockerfile and Docker Compose inspection, a hidden-Unicode scan of agent instruction files, `SKILL.md` manifest scanning, and CVE matching against OSV. The embedded prompt-injection classifier is not built yet. See [Measured coverage](#measured-coverage) for what the test corpus does and does not prove, and [Roadmap](#roadmap) for what is missing.
+> **Status: alpha.** `bastyn scan` finds real issues today: 55 AST rules over Python, TypeScript and JavaScript across the OWASP GenAI and Anthropic Zero Trust categories, plus MCP manifest inspection, Dockerfile and Docker Compose inspection, a hidden-Unicode scan of agent instruction files, `SKILL.md` manifest scanning, and CVE matching against OSV. The embedded prompt-injection classifier is not built yet. See [Measured coverage](#measured-coverage) for what the test corpus does and does not prove, and [Roadmap](#roadmap) for what is missing.
 
 ## Why BASTYN
 
@@ -41,7 +45,7 @@ No wall-clock benchmark has been published, so this README does not claim one.
 
 ## Install
 
-Requires Rust 1.88 or newer ([rustup.rs](https://rustup.rs)).
+Requires Rust 1.90 or newer ([rustup.rs](https://rustup.rs)).
 
 ```console
 git clone https://github.com/BASTYN-labs/bastyn-scan.git
@@ -58,6 +62,18 @@ brew install bastyn-labs/tap/bastyn
 curl -fsSL https://raw.githubusercontent.com/BASTYN-labs/bastyn-scan/main/install.sh | sh
 ```
 
+### Use it from a coding agent
+
+This repository ships an [Agent Skill](https://agentskills.io) at [`skills/bastyn-scan`](skills/bastyn-scan/SKILL.md) that teaches a coding agent how to run `bastyn scan` and report the result accurately, including what was not covered. It works with agents that support the Agent Skills format, such as Claude Code.
+
+```console
+npx skills add bastyn-labs/bastyn-scan --skill bastyn-scan
+```
+
+Then ask your agent: "Scan this repository with Bastyn and show me what to fix first."
+
+The skill does not include the `bastyn` executable. If it is missing, the agent asks before installing it. By default the skill scans with `--offline`, and offers the dependency CVE lookup afterwards.
+
 ## Usage
 
 A complete run, pasted verbatim, over a three-file project: an `agent.py` that passes a model reply to `eval()` and asks for a completion with no token ceiling, a `config.py` holding a provider key as a literal, and a `requirements.txt` of three pinned dependencies.
@@ -68,7 +84,7 @@ Bastyn scan: .
 Mode: online
 
 [ok] Discovered source tree
-[ok] Analysed 3 files with 44 rules
+[ok] Analysed 3 files with 55 rules
 [ok] Parsed 3 dependencies
 [ok] OSV vulnerability lookup - 3 dependencies checked
 
@@ -110,6 +126,11 @@ Confidence: high | Category: ZT1
   Fix:
   Load the key from an environment variable or secret manager
   (os.environ["OPENAI_API_KEY"]) and rotate the key that leaked into history.
+
+
+Files read
+----------
+0 skill files, 0 skill references, 0 MCP configs, 0 instruction files read.
 
 
 Coverage gaps
@@ -177,7 +198,11 @@ Test code is held to the same rules and reported differently. A password invente
 | `[PATH]` | Directory to scan (default: `.`) |
 | `--fail-on <LEVEL>` | Minimum severity that exits non-zero: `none`, `low`, `medium`, `high` (default), `critical` |
 | `--show-observations` | Show context-dependent observations too |
-| `--offline` | Skip the CVE lookup, the only step that uses the network |
+| `--show-coverage` | List every file the scan read, grouped by kind, in the text report |
+| `--offline` | Skip the CVE lookup and do not send the anonymous scan summary. Also overrides `--inspect-remote` |
+| `--inspect-remote` | Connect to the public `https` MCP servers named in config files and check the tools they list. Off by default. See [The network, and the kill switch](#the-network-and-the-kill-switch) |
+| `--save-snapshots <DIR>` | With `--inspect-remote`, write each inspected server's tool list to `<DIR>` as `*.bastyn-tools.json` |
+| `--no-reporting` | Do not send the anonymous scan summary. See [Reporting](#reporting) |
 | `-f`, `--format <FORMAT>` | `text` (default), `json`, or `sarif` |
 | `--group-by <TAXONOMY>` | Which framework to expand in full: `layer` (the default, which expands none and summarises all three), `eu-ai-act`, `nist-ai-rmf`, or `nist-genai`. See [Compliance crosswalk](#compliance-crosswalk) |
 | `-q`, `--quiet` | Print only the summary line |
@@ -198,29 +223,84 @@ Test code is held to the same rules and reported differently. A password invente
 
 An execution error outranks findings, so a scan that could not run never returns a `1` you might read as "the code merely has issues". Only defects can produce a `1`; observations never can.
 
+A CVE lookup that could not run, or that ran only partly, does not change the exit code. Every output format says so: the terminal summary, the JSON `cve.status` field (`unreachable` or `partial`), and a SARIF tool-execution notification.
+
+### `bastyn inspect-server`
+
+Connects to one MCP server and writes the tools it lists to a snapshot file.
+
+```sh
+bastyn inspect-server --url <URL> [--header 'Name: value']... [--out <FILE>]
+bastyn inspect-server --config <FILE> --server <NAME> [--allow-spawn] [--out <FILE>]
+```
+
+| Argument | Effect |
+| --- | --- |
+| `--url <URL>` | A Streamable HTTP server. Conflicts with `--config` |
+| `--header 'Name: value'` | A request header sent with `--url`, for example a bearer token. Repeatable |
+| `--config <FILE>` | An MCP config file holding the server entry. Needs `--server` |
+| `--server <NAME>` | The entry's name in `--config`. An entry with a `url` is captured over HTTP using its `headers`; an entry with a `command` is run over stdio, but only with `--allow-spawn` |
+| `--allow-spawn` | Permit starting the entry's `command`. Without it the command is refused and nothing runs |
+| `--out <FILE>` | Write the snapshot here instead of standard output |
+
+A summary line (`captured N tools from <name> (<era>)`) goes to standard error. Exit `0` means a snapshot was written. Exit `2` means it could not be: a refused address or command, a connection failure, a server that needs credentials, an unusable config or a reply outside the protocol. Exit `1` is not used. Name the file `<name>.bastyn-tools.json`, which is the name `scan` looks for. The snapshot is deterministic: tools are sorted and keys are ordered, so two captures of an unchanged server are byte-identical. Text that came from the server is shown with control characters escaped.
+
+#### Checking a snapshot
+
+The whole workflow is two commands, and the second makes no connection:
+
+```sh
+bastyn inspect-server --url https://example.com/mcp --out notes.bastyn-tools.json
+bastyn scan .
+```
+
+`bastyn scan` reads any `bastyn-tools.json` or `*.bastyn-tools.json` file in the tree and checks the text an agent reads for each tool: its `name`, `title` and `description`, and every `description` inside its `inputSchema`. A file that is not valid JSON or names a different `schema` is ignored, not reported. One finding per rule per tool. The reported line is the first one that mentions the tool's name, so it is approximate.
+
+| Rule | What it flags |
+| --- | --- |
+| `BAS-MCP-010` | Invisible text in a tool's text: zero-width space, word joiner and the invisible math operators, bidi overrides and isolates, byte-order mark, and the Unicode tag block. Joiners (`U+200C`, `U+200D`), direction marks and the emoji variation selector are not flagged, because emoji and right-to-left text use them. A defect |
+| `BAS-MCP-011` | A hidden-instruction marker in a tool's text: `<important>`, `<hidden>`, `do not mention`, `do not tell the user`, `present it as if`. A defect |
+| `BAS-MCP-012` | An instruction-override phrase such as `ignore previous instructions` or `bypass the safety`. An observation, hidden by default |
+
 ### What it checks
 
-**44 rule ids** over the Python, TypeScript and JavaScript ASTs, via [`ast-grep`](https://ast-grep.github.io), loaded from `crates/bastyn-core/rules/*.yml`. A rule written for JavaScript is compiled against the JavaScript, TypeScript and TSX grammars alike, which is what "JS/TS" means below. Each rule's severity, description and remediation text live in those files, which are the reference this table summarises.
+**55 rule ids** over the Python, TypeScript and JavaScript ASTs, via [`ast-grep`](https://ast-grep.github.io), loaded from `crates/bastyn-core/rules/*.yml`. A rule written for JavaScript is compiled against the JavaScript, TypeScript and TSX grammars alike, which is what "JS/TS" means below. Each rule's severity, description and remediation text live in those files, which are the reference this table summarises.
 
 | Rule ids | What they match | Languages |
 | --- | --- | --- |
-| `BAS-LLM10-001` to `-008` | Model output reaching `eval`/`exec`, a shell command, or a SQL string, including through one local variable; `eval`/`exec`/`new Function` on any non-literal expression | Python, JS/TS |
+| `BAS-LLM10-001` to `-008` | Model output reaching `eval`/`exec`, a shell command, or a SQL string, including through one local variable; `eval`/`exec`/`new Function` on any non-literal expression. `-001` to `-004` and `-008` (Python) ask the flow graph where the value came from, and `-002` to `-004` fall back to a low-confidence observation when the origin can't be traced; `-005` to `-007` (JS/TS) are observations outright, because there is no dataflow graph for those languages yet | Python, JS/TS |
+| `BAS-LLM10-009`, `-012`, `-017`, `-018` | A non-literal command reaching a shell regardless of any allowlist/denylist check; a file opened at a path built by joining or interpolating a non-literal value with no `realpath`/`abspath` resolution, even past a bypassable string-prefix containment check; an interpolation-built SQL query reaching `.execute()` either directly or after first being assigned to a local variable. Each is reported unconditionally on the composition matched — unlike `-001` to `-008` above, an untraceable origin never downgrades one of these to an observation | Python |
 | `BAS-LLM10-010`, `-011`, `-013` to `-016`, `BAS-LLM03-010` to `-012` | Named unsafe library APIs: `allow_dangerous_code`, `allow_dangerous_deserialization`, `allow_dangerous_requests`, `torch.load` without `weights_only`, `yaml.load` without a safe loader, `LLMMathChain`, `PandasQueryEngine`, `PALChain`, a LangGraph serializer with `pickle_fallback` | Python |
-| `BAS-ZT1-001` to `-003` and `-010` to `-013`, `BAS-LLM02-001`, `-002`, `-004`, `-005`, `BAS-LLM08-001`, `-002` | Credential literals: provider API keys, a key handed to a client constructor, a bearer token in tool or skill code, a secret inside a prompt template, a default admin password seeded by a setup script | Python, JS/TS |
-| `BAS-ZT4-001` to `-003` | Raw user input, or a caller-supplied override, folded into a system prompt | Python, JS/TS |
-| `BAS-ZT2-001`, `-002`, `BAS-LLM03-001`, `-002`, `-030` | Wildcard tool grants, and destructive agent tools invoked with no confirmation guard | Python, JS/TS |
+| `BAS-ZT1-001` to `-003`, `-010` to `-013` and `-018` to `-020`, `BAS-LLM02-001`, `-002`, `-004`, `-005`, `BAS-LLM08-001`, `-002` | Credential literals: provider API keys, a key handed to a client constructor, a hardcoded JWT or AWS access key ID, a credential-shaped default argument to an `os.environ.get()`/`os.getenv()` call, a bearer token in tool or skill code, a secret inside a prompt template, a default admin password seeded by a setup script | Python, JS/TS |
+| `BAS-LLM01-002`, `-003` | MCP "tool poisoning": a hidden instruction block, or a suspicious instruction-override phrase, riding along inside a tool's own docstring/description — text a human reviewer approving the tool would never read as an instruction, but a host's tool-discovery mechanism reads directly | Python |
+| `BAS-ZT4-001` to `-003` | Raw user input, or a caller-supplied override, folded into a system prompt. `-001`/`-002` (Python) use the flow graph to decide whether to report; all three are observations | Python, JS/TS |
+| `BAS-ZT2-001`, `-002`, `BAS-LLM03-001`, `-002`, `-030` | Wildcard tool grants, and destructive agent tools invoked with no confirmation guard. `BAS-LLM03-001`/`-002` are observations: a tool's name is not proof that it is destructive | Python, JS/TS |
 | `BAS-ZT5-001`, `-003`, `-004`, `BAS-ZT2-010` | Module-level chat history mutated per request, singleton memory, a literal `thread_id`, a shell middleware with no execution policy. Observations, because whether globally-keyed memory is wrong depends on whether the deployment is multi-tenant, and a source tree does not say | Python |
 | `BAS-LLM06-001`, `-002` | An LLM call with no token ceiling. Observations | Python, JS/TS |
+| `BAS-ZT3-001`, `-002` | An HTTP MCP server that binds all network interfaces (`0.0.0.0` or `::`) in a file that shows no SDK authentication. Observations | Python, JS/TS |
 
 Not every rule fires equally well in every language yet, and several of the known gaps are JS/TS-specific.
 
-**One rule does not run on shape alone.** `BAS-LLM10-001` claims a value came out of a model, and a pattern over the call site cannot know that. So a structural match on `eval($ARG)`/`exec($ARG)` is handed to a second tier, `crates/bastyn-core/src/flow/`, which builds a per-file dataflow graph and drops the match unless `$ARG` traces back to a model call or to a local function that returns one. The graph is Python-only, single-file, and follows local calls one level deep. Where it cannot prove a single origin it answers "unknown", which never satisfies the gate, so an unresolvable value produces silence rather than a guess. `crates/bastyn-core/tests/brittleness_gate.rs` measures what that bought over the identifier-name gate it replaced: 0 of 10 realistic renamings of the identical bug survived the name gate, 10 of 10 survive the provenance gate, and the eight innocent `json.load`-sourced samples the rule must not fire on stay rejected. Thirteen name gates on other rules have not been migrated.
+**Some rules check where a value came from.** `BAS-LLM10-001` claims a value came out of a model, and a pattern over the call site cannot know that. So a structural match on `eval($ARG)`/`exec($ARG)` is handed to a second tier, `crates/bastyn-core/src/flow/`, which builds a per-file dataflow graph and asks it where the matched value actually came from. `BAS-LLM10-002` to `-004` and `BAS-ZT4-001`/`-002` ask the same graph the same question for a shell command, a SQL string, and a system prompt. What's common to all six: a value traced to one of the rule's catalogued sources is a defect, and a literal, a value built only from literals, or one a fixed-set check already closes off is not reported at all. What happens when the graph cannot resolve a single origin differs per rule, though — an untraceable value is never silently promoted to a defect just because a name looks right:
 
-Five more checks are built into the engine rather than written as rules:
+- `BAS-LLM10-001` (source: a model call): silence. There is no observation fallback for this rule.
+- `BAS-LLM10-002`/`-003` (source: a model call): a low-confidence observation, but only when the untraced value's own name still reads like a model reply (`response`, `reply`, `completion`, ...).
+- `BAS-LLM10-004` (source: a model call, an HTTP request, retrieved context, tool output, a file read, or a network read): a low-confidence observation regardless of what the value is named.
+- `BAS-ZT4-001`/`-002` (source: request data, tool output, retrieved context, or a file/network read): an observation either way; an untraced value is reported only when the untraced value's own name still reads like user input (`-001`) or a caller-supplied override (`-002`).
 
-- **MCP manifests** (`BAS-MCP-000` to `-005`, `BAS-LLM03-020`). `mcp.json`, `.mcp.json`, `claude_desktop_config.json` and the YAML and TOML equivalents, all parsed into one model so a check cannot differ by file type. A manifest that does not parse, root or broad filesystem grants, unauthenticated plaintext HTTP, wildcard tool grants, credentials in a server's environment, an `autoApprove`/`alwaysAllow` wildcard, and a server launched from a registry with no version pin. `npx -y @scope/server-x` resolves to whatever the registry serves when the agent starts, so code inside the trust boundary can change with no change to your repository; a pinned server (`npx -y @scope/server@1.2.3`, `uvx server@1.2.3`) is resolved and queried against OSV like any other dependency, though it appears in no `package.json`. Bastyn does not inspect a server's own source.
-- **Agent instruction files** (`BAS-LLM01-001`). A byte-level scan of `SKILL.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `*.prompt` and every MCP file above, for codepoints that render as nothing: the zero-width characters, the five bidi override and embedding controls, and the Unicode tag block. A human reviewing the diff sees only the visible text while the model reads the hidden payload too. Ordinary non-ASCII text is never flagged, and a `U+FEFF` at the very first byte is read as a byte-order mark.
-- **`SKILL.md` manifests** (`BAS-SKILL-001` to `-003`). Any file named `SKILL.md`, anywhere in the tree, checked three ways: incomplete frontmatter (missing `name`, `description`, `version`, or `permissions`); classic instruction-override phrasing ("ignore all previous instructions" and similar) embedded in the file's own text, which a skill-discovery mechanism reads directly; and language telling the agent not to pause for confirmation before a chain of consequential actions. A `SKILL.md` is both a manifest a host trusts and a text file a model reads, so it fails in ways `AGENTS.md`'s hidden-Unicode scan does not cover.
+`builtin_callee: true` drops a call through a name the file itself rebinds, such as a local `def eval`, so `BAS-LLM10-001` and `-004` do not fire on a same-named function that is not the Python builtin. `none_in_file` on `BAS-ZT4-001` to `-003` skips a prompt the same file sends in the user role rather than as a system prompt. The graph itself is Python-only, single-file, and follows local calls one level deep; where it cannot prove a single origin it answers "unknown", which never satisfies the gate, so an unresolvable value produces silence rather than a guess unless the rule's `unproven` clause opts it into the low-confidence observation path above. One limitation: combining a traced source with an untraced one — an f-string that interpolates both a model reply and a function parameter, for instance — also answers "unknown", because the graph has no way to say which of the two the sink actually receives. That case is reported as an observation today, not a defect, even though one of its two ingredients really did come from the model.
+
+TypeScript and JavaScript have no dataflow graph yet, so their equivalents (`BAS-LLM10-005` to `-007`, `BAS-ZT4-003`) stay observation-only until one exists. Both tool-name rules, `BAS-LLM03-001`/`-002`, are observation-only for a different reason that no dataflow graph will fix: a function's or a tool's name is never proof that it is destructive, in either language.
+
+`crates/bastyn-core/tests/brittleness_gate.rs` measures what asking the flow graph bought over the identifier-name gate it replaced, from `cargo test -p bastyn-core --test brittleness_gate -- --nocapture`. `BAS-LLM10-001`'s, `-002`'s and `-003`'s `ARG` gates now survive 100% of the 10 realistic renamings the file tests for that variable, with 0% false-fire on the 8 samples that pair one of the gate's own trigger words (`response`, `completion`, `output`, ...) with a genuinely innocent `json.load`-sourced value; the widened variant (the flow clause dropped, the bare structural pattern left) also survives all 10 renamings, but now false-fires on all 8 of those innocent samples too. `BAS-ZT4-001`'s `VAR` gate is measured on different samples and scores the same shape of result: 100% survival across the 7 renamings the file tests for that variable, and 0% false-fire on the 5 samples that pair one of the gate's own trigger words (`user_input`, `request_body`, `raw_query`, `chat_message`, `input_text`) with a fixed, hardcoded string rather than untrusted input; its widened variant again survives all 7 renamings but false-fires on all 5 of those samples. Ten other naming gates the file measures (`BAS-LLM10-003`'s `CUR` receiver check, `-006`, `-007`, `BAS-ZT4-001`'s `SYS` target check, `BAS-ZT4-003` twice, `BAS-LLM08-001`, `BAS-LLM06-001`, `BAS-LLM03-001`/`-002`) have not migrated; most still survive 0% of their own realistic renamings. The file's overall real-world survival rate across every gate it measures is 32.8% (39 of 119 renamings).
+
+Six more checks are built into the engine rather than written as rules:
+
+- **`.env` files** (`BAS-ZT1-021`, `-022`). Any `.env` or `.env.<suffix>` file the walker reaches — walked and analysed regardless of `--hidden`, since a scanner that skips `.env` by default misses exactly the material most worth checking. Every `KEY=value` line is judged by the same credential-shape logic already backing `BAS-INFRA-002`/`-006`: `-021` for a provider API key literal (the `sk-...` shape), `-022` for any other credential-shaped literal. `.env.example`, `.env.sample`, `.env.template` and `.env.dist` are still walked and counted as scanned, but never flagged — they document the variables a real `.env` must set, not a leaked secret.
+- **Provider tokens** (`BAS-ZT1-023`). A literal with the exact format of a GitHub token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`), an AWS access key ID (`AKIA`, `ASIA`), a Google API key (`AIza`), an npm token (`npm_`) or a Stripe live secret key (`sk_live_`), in any source, instruction, MCP or `.env` file the scan reads. The value is judged on prefix, alphabet and length alone, never on a variable name, and a value is skipped when it sits in a URL, a Markdown link target or a file path, is a digest or pin, has an all-hexadecimal body, or is a placeholder. A line another credential check already reported is not reported again. In test paths it is an observation.
+- **MCP manifests** (`BAS-MCP-000` to `-009`, `BAS-LLM03-020`). `mcp.json`, `.mcp.json`, `claude_desktop_config.json` and the YAML and TOML equivalents, all parsed into one model so a check cannot differ by file type. A manifest that does not parse, root or broad filesystem grants, unauthenticated plaintext HTTP, wildcard tool grants, credentials in a server's environment, an `autoApprove`/`alwaysAllow` wildcard, a server launched from a registry with no version pin, a shell wrapper that downloads and runs code, a container launched with `--privileged` or the Docker socket mounted, host networking (an observation), and a literal credential in a server URL's query string. `npx -y @scope/server-x` resolves to whatever the registry serves when the agent starts, so code inside the trust boundary can change with no change to your repository; a pinned server (`npx -y @scope/server@1.2.3`, `uvx server@1.2.3`) is resolved and queried against OSV like any other dependency, though it appears in no `package.json`. An MCP server's own source is checked for one case: `BAS-ZT3-001` (Python) and `BAS-ZT3-002` (TypeScript and JavaScript) report an HTTP MCP server that binds all network interfaces while the same file shows no authentication. These are observations, hidden by default, because authentication is often provided outside the file.
+- **Agent instruction files** (`BAS-LLM01-001`). A byte-level scan of `SKILL.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `*.prompt` and every MCP file above, for codepoints that render as nothing: the zero-width characters, the five bidi override and embedding controls, and the Unicode tag block. A human reviewing the diff sees only the visible text while the model reads the hidden payload too. Ordinary non-ASCII text is never flagged, and a `U+FEFF` at the very first byte is read as a byte-order mark. Matches are observations, shown with `--show-observations`, since the characters alone do not show a concealed instruction.
+- **`SKILL.md` manifests** (`BAS-SKILL-001` to `-003`). Any file named `SKILL.md`, anywhere in the tree, checked three ways: frontmatter missing `name` or `description`, the two fields the [Agent Skills specification](https://agentskills.io/specification) actually requires, filed as an observation rather than a defect since a spec-validity gap is not itself a security claim; classic instruction-override phrasing ("ignore all previous instructions" and similar) embedded in the file's own text, filed as an observation since the text alone does not show whether the file tells the agent to follow the phrase or only quotes it; and language telling the agent not to pause for confirmation before a chain of consequential actions, filed as an observation since the repository cannot show whether skipping confirmation is wrong for that skill. A `SKILL.md` is both a manifest a host trusts and a text file a model reads, so it fails in ways `AGENTS.md`'s hidden-Unicode scan does not cover. `BAS-SKILL-010` reports text, or a shell or PowerShell script (`.sh`, `.bash`, `.zsh`, `.ps1`) inside a skill folder, that downloads code from a URL and runs it with no check: a download piped or passed into a shell (`curl URL | sh`, `bash <(curl URL)`, `irm URL | iex`), a script or executable downloaded to a file and then run, or a cloned repository whose `install`, `setup` or `bootstrap` script is then run. It needs a literal `http` or `https` URL, it is skipped when a checksum, signature or review step sits between the download and the run, and it is skipped when the text refuses or quotes the command. Observation only. `BAS-SKILL-011` reads the same files for prose that tells the reader to fetch code from a URL. A small bundled model, fixed weights and no network, scores each seven-line passage around a download word (`curl`, `wget`, `npx`, `download`, `git clone` and similar); a passage with a literal `http` or `https` address that scores 0.80 or more is a defect, one that scores from 0.30 up to 0.80 is a low-confidence observation, and a file gets one finding for its highest-scoring passage. `BAS-SKILL-012` is a defect for text that hides the code the reader is told to run: a link to a public paste or snippet site (a few dozen are listed) next to an instruction to copy or run it in a terminal, a link to an archive or executable together with a stated password and an instruction to run it, or a base64-decoded command piped into a shell. It is skipped when six lines either side read as a warning or as a description of an attack ("never", "malicious", "indicator", "attack" and similar). One finding per file, at the first such line.
 - **Container configuration** (`BAS-INFRA-001` to `-006`, `-010`). Dockerfiles and Compose files: `USER root` as the effective final user, a provider key or password in `ENV`/`ARG` or a Compose `environment:`, a `/var/run/docker.sock` mount, `privileged: true`, `network_mode: host`, `pid: host`. ZT3, meaning no sandbox boundary, is close to undetectable in application source because the boundary is not expressed there. It is expressed mechanically here. `BAS-INFRA-001` files an explicit root user as a defect and a missing `USER` instruction as an observation: 35 of the 57 Dockerfiles in the calibration corpus carry no `USER` at all, so filing each as a defect would drown the one case that is unambiguous.
 - **Dependencies** (`BAS-CVE-001`, `BAS-LLM04-001`). `requirements.txt`, `pyproject.toml`, `package.json` and `Cargo.toml`, matched against [OSV.dev](https://osv.dev) with no API key and no account. One finding per vulnerable dependency rather than per advisory, since a package with eleven advisories is still one upgrade to make; every CVE and GHSA id is kept in the report's `references` field and in the SARIF result properties. An unpinned range is reported as unchecked rather than guessed at. `BAS-LLM04-001` is a separate low-severity observation and the one dependency check that needs no network: an agent framework, the MCP SDK or a model-provider SDK pinned to a genuine wildcard or to a range with no upper bound. A caret or tilde range is the bounded default of `npm install` and Poetry, and is not this finding.
 
@@ -236,9 +316,26 @@ Three things are left out on purpose, and all three are listed in the report's "
 
 ### The network, and the kill switch
 
-The CVE lookup is the only thing that touches the network. It sends dependency names and versions to OSV, never your code and never your findings. This is what `npm audit` and `pip-audit` already do.
+The scan itself touches the network in one place: the CVE lookup. It sends dependency names and versions to OSV, never your code and never your findings. This is what `npm audit` and `pip-audit` already do. After a completed scan, Bastyn also sends a small anonymous summary, described under [Reporting](#reporting).
 
-With no connection, Bastyn skips CVEs and says so under "Coverage gaps", with the reason on the line. It never hangs, never fails the scan because OSV is down, and never reports zero CVEs as though the check had run. `--offline` forces the skip.
+With no connection, Bastyn skips CVEs and says so under "Coverage gaps", with the reason on the line. It never hangs, never fails the scan because OSV is down, and never reports zero CVEs as though the check had run. `--offline` forces the skip, and also stops the summary upload.
+
+`bastyn scan` connects to MCP servers only when you pass `--inspect-remote`. With the flag, the scan looks at each MCP server entry in the config files it read and contacts only the Streamable HTTP entries whose URL is `https` and resolves only to public addresses. The connection is pinned to the address that was checked, no redirect is followed and no proxy is used. The server learns the scanner's IP address and that the repository lists it. For a server that was inspected, the existing snapshot checks `BAS-MCP-010` to `BAS-MCP-012` report at that server's entry in the config file. `--save-snapshots <DIR>` writes one `*.bastyn-tools.json` per inspected server into `DIR`, creating it if missing, and does nothing under `--offline`; if `DIR` cannot be written the scan exits `2`.
+
+It never contacts an entry that has any header, a user name or password in its URL, or a `$` placeholder in its URL, so headers and credentials a repository supplies are never sent. It never starts a `command` (stdio) entry, and it skips entries declared as SSE (the older Server-Sent Events transport), loopback, private, link-local, shared-address-space and other non-public addresses, and plain `http`. `--offline` overrides the flag: every eligible entry is listed as `offline` and nothing is contacted. Every entry the flag considered appears in `coverage.remote_servers` in the JSON report, and the text report lists the ones it did not inspect under "Coverage gaps". A server that answers 401 or 403, and a name that does not resolve, are listed there too, as `needs_credentials` and `unreachable`. An uninspected server never changes the exit code.
+
+The only limits are the per-request ones (10 seconds to connect, 30 seconds per request, 4 MiB per reply, 20 pages per server), so a repository that lists many slow servers can keep the scan running for a long time; run it under a job timeout in CI. Output with the flag on can differ between runs, because servers change or are down; `--offline` output stays deterministic. It does no OAuth, does not speak the legacy SSE transport, is untested on Windows, and the live path has been tried by hand against a few public servers and is not otherwise tested in CI.
+
+`bastyn inspect-server` is the command for a single server you name, including loopback and private addresses, and the only one that starts a command from a config. It runs only when you run it. It sends no scan summary. It refuses link-local and cloud-metadata addresses and any scheme other than http or https, never follows redirects, caps the size of a reply, the number of pages and the time, runs stdio commands only with `--allow-spawn` and with a cleared environment (plus `PATH`, `HOME` and the entry's own `env`), and does no OAuth. A plain `http://` URL to a non-local host prints a warning, because the traffic and any `--header` values are not encrypted.
+
+Known limitations of `inspect-server`:
+
+- The address check resolves the host, and the HTTP client resolves it again when it connects. A DNS server that answers differently the second time can defeat the check.
+- The time limit applies to each request, not to the whole capture. A slow server can hold the command for up to the page cap (20 pages) times the per-request limit (30 seconds).
+- For stdio, shutdown closes the server's input, waits about two seconds, then kills only the direct child process. A grandchild process the server started may survive.
+- The command is untested against real-world servers. It has been tested only against local fake servers.
+
+Run it in a container or sandbox for servers you do not trust.
 
 ### Output for machines
 
@@ -254,11 +351,21 @@ With no connection, Bastyn skips CVEs and says so under "Coverage gaps", with th
   },
   "cve": { "status": "checked", "dependencies": 3 },
   "findings": [ ... ],
+  "coverage": {
+    "mcp_manifests": [".mcp.json"],
+    "skill_files": [],
+    "skill_reference_files": [],
+    "instruction_files": ["AGENTS.md"],
+    "skill_unanalysed": [],
+    "skipped": []
+  },
   "crosswalks": [ ... ]
 }
 ```
 
 `observations` is `1` where the text report said "1 observation hidden": the count is of what the scan found, not of what was printed. `findings` carries observations only under `--show-observations`. A `skipped` array appears alongside them when the scan skipped anything, and is omitted entirely when it did not, so an empty array can never be mistaken for "nothing was checked". Field names are a contract: fields may be added, existing fields keep their names and meanings.
+
+`coverage` says which agent files the scan read, by kind, with paths relative to the scanned root. `mcp_manifests` lists the MCP configuration files that were read and parsed. A config that fails to parse is not listed there; it is reported as a `BAS-MCP-000` finding instead. `skill_files` lists the `SKILL.md` files that were read, `skill_reference_files` lists the text files (`.md`, `.markdown`, `.txt`) inside a skill's `references/` folder that were read and checked for instruction-override language, skip-confirmation language and hidden Unicode, and `instruction_files` lists the other instruction files, such as `AGENTS.md`. A file appears under one kind only, so an MCP config is not repeated in `instruction_files`. `skill_unanalysed` lists the files inside a skill directory (the folder of a `SKILL.md`) that no analyser reads, such as images, so a skill's unreviewed content is visible. It lists every unanalysed file inside a skill folder, uncapped; for a `SKILL.md` at the scan root it covers only the `scripts/`, `references/` and `assets/` folders. `skill_script_files` lists the shell and PowerShell scripts inside a skill folder that were read and checked for download-and-run commands; it is omitted when empty, so the other six keys are always present. An empty `mcp_manifests` means no MCP configuration was parsed. `coverage.remote_servers` is present only when `--inspect-remote` ran. It has one entry per MCP server considered, `{file, server, status, tools?}`, where `status` is `inspected` (with `tools`, the number of tools listed), `not_public`, `needs_credentials`, `unsupported`, `unreachable` or `offline`. `coverage.skipped` is the `skipped` array with the reason as a field (`excluded`, `ignore_file`, `generated`, `unreadable`, `unparseable`, `unpinned`), in the same order, and it carries a `detail` string when there is one. `skipped` itself is unchanged.
 
 `--format sarif` emits SARIF 2.1.0 for GitHub Advanced Security and GitLab. Observations always map to `note` level, so a context-dependent observation can never block a pull request.
 
@@ -308,20 +415,52 @@ jobs:
           category: bastyn
 ```
 
+## Reporting
+
+After each completed scan, Bastyn sends one small anonymous summary of the run, unless you turn it off. The first run on a machine prints a notice about this on stderr.
+
+**What is sent:**
+
+- counts of findings, grouped by rule ID, severity and kind (defect or observation)
+- coverage counts: files scanned, files skipped (by reason), and whether the dependency lookup ran
+- the scan status (`complete` or `partial`)
+- the Bastyn version
+- a project ID and a run ID (see below)
+- the start and end time of the scan
+- whether the scan ran in GitHub Actions, GitLab CI, another CI system, or locally
+
+**What is never sent:** file paths, source code, finding text, dependency names, the repository name or URL, or your username. The exact format is a JSON Schema, `crates/bastyn-core/tests/data/reporting/scan-summary.v1.schema.json`, and every field is a count, an enumerated value or one of the identifiers above.
+
+**The project ID** lets scans of the same repository from different machines group together. It is the SHA-256 hash of the normalised git remote (`host/owner/repo`, so the ssh and https spellings of one remote agree). The repository's git configuration is read as plain data; `git` is never run. When there is no remote, CI provider variables are used if present, and otherwise a random value is generated once and stored per folder in your user state directory (`$XDG_STATE_HOME/bastyn`, or `~/.local/state/bastyn`). The name itself is never sent, but a hash can be confirmed by anyone who guesses the name and hashes it, so treat the ID as pseudonymous rather than secret. The **run ID** is a fresh random value for each scan.
+
+**Turning it off.** Any one of these stops reporting, and nothing is read from or written to the state directory when it is off:
+
+- `--no-reporting`
+- `--offline`
+- the `DO_NOT_TRACK` environment variable set to any value other than `0` (an empty or unset value does not opt out)
+
+Nothing in the scanned repository can turn reporting on or off or change where the summary goes.
+
+**A failed upload never changes the scan.** The summary is sent after all output has been written. The report, `--format json` and SARIF output, and the exit code are the same whether the upload succeeds, fails, or times out. A failure prints one line on stderr and nothing else. Uploads are retried a small, bounded number of times and give up quickly.
+
+`bastyn project-id [PATH] --explain` prints the project ID a scan of `PATH` would report, how it was derived, and exactly what was hashed. It reads files only: it creates nothing and uses no network.
+
 ## Measured coverage
 
-A corpus under [`tests/corpus/`](tests/corpus/) specifies what should and should not be found, and a gate measures the engine against it on every push. Its output, verbatim, from `cargo test -p bastyn-core --test corpus_gate -- --nocapture`:
+A corpus under [`tests/corpus/`](tests/corpus/) specifies what should and should not be found, and a gate measures the engine against it on every push. Its output, verbatim, from `cargo test -p bastyn-core --test corpus_gate corpus_gate -- --nocapture`:
 
 ```
-corpus: 53/53 planted defects found   (found 100%)
-        0 unexpected findings             (precision 100%)
-        13 known gaps (+8 reachable only with a network connection)
-        2 known false positives (precision debt -- tracked separately from known gaps, see MAX_KNOWN_FALSE_POSITIVES)
+corpus: 99/99 expected defects found        (recall on this corpus 100%)
+        29/29 expected observations found
+        99/103 defects returned are expected   (defect precision on this corpus 96%, known false positives included)
+        0 unaccounted findings
+        17 known gaps (+8 reachable only with a network connection)
+        4 known false positives (precision debt -- tracked separately from known gaps, see MAX_KNOWN_FALSE_POSITIVES)
 ```
 
-Every fixture in that corpus is one we wrote, so "53/53" is a regression alarm and not a coverage figure: the engine finds 53 of 53 defects *we planted*, and real-world recall is unmeasured. A more honest single number folds the known gaps back in, at 53/(53+13) ≈ 80% of planted defects, excluding the 8 gaps that are unreachable only because CI runs `--offline`.
+Every fixture in that corpus is one we wrote, so "99/99" is a regression alarm and not a coverage figure: the engine finds every defect and observation designated as an expected detection, and real-world recall is unmeasured. Defect precision's denominator is every defect the scan returned on this corpus, known false positives included, not just the ones that were expected — a false positive would show up as a defect returned but not expected, which is exactly what would pull that percentage down. A more honest single recall number folds the known gaps back in, at 99/(99+17) ≈ 85% of expected defects, excluding the 8 gaps that are unreachable only because CI runs `--offline`.
 
-The gaps are published rather than hidden. Each one names the code shape we miss and why, in [`tests/corpus/expected.toml`](tests/corpus/expected.toml), and the count fails the build if it grows. The two known false positives are ratcheted on a separate line, because a recall gap and a precision gap are not the same problem.
+The gaps are published rather than hidden. Each one names the code shape we miss and why, in [`tests/corpus/expected.toml`](tests/corpus/expected.toml), and the count fails the build if it grows. Known false positives are ratcheted on a separate line, currently four, because a recall gap and a precision gap are not the same problem.
 
 Of the 19 framework categories Bastyn maps to (see [`docs/frameworks/`](docs/frameworks/)), 12 have a detector behind them: LLM01, LLM02, LLM03, LLM04, LLM06, LLM08, LLM10, ZT1, ZT2, ZT3, ZT4, ZT5. LLM09 and ZT6 are recognised categories with no detector yet, and the remaining five (LLM05, LLM07, ZT7, ZT8, ZT9) are not code-detectable at all, as `tests/corpus/vulnerable/NOT_DETECTABLE.md` sets out. Having a detector for a category is not the same as covering it, and the published gaps sit inside categories that are in this count.
 

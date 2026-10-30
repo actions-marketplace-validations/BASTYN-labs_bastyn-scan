@@ -33,6 +33,12 @@ mod tests {
     /// that vanish when empty. Presentation work on the terminal renderer has
     /// no business changing any of it, and a diff here is the fastest way to
     /// notice that it did.
+    ///
+    /// `coverage.remote_servers` is absent here because it is omitted when
+    /// empty. With `--inspect-remote` it is present as an array of
+    /// `{"file", "server", "status", "tools"?}`, `status` being one of
+    /// `inspected`, `not_public`, `needs_credentials`, `unsupported`,
+    /// `unreachable` or `offline`, and `tools` present only when inspected.
     const CONTRACT: &str = r#"{
   "bastyn_version": "0.1.0",
   "root": "/repo",
@@ -83,7 +89,15 @@ mod tests {
       "description": "No max_tokens ceiling is set on this call.",
       "remediation": "Set a token ceiling appropriate to the caller."
     }
-  ]
+  ],
+  "coverage": {
+    "mcp_manifests": [],
+    "skill_files": [],
+    "skill_reference_files": [],
+    "instruction_files": [],
+    "skill_unanalysed": [],
+    "skipped": []
+  }
 }"#;
 
     #[test]
@@ -178,7 +192,11 @@ mod tests {
     /// as "nothing was left out" for a scan that never looked.
     #[test]
     fn an_empty_skipped_list_emits_no_key() {
-        assert!(!render(&empty_report()).unwrap().contains("\"skipped\""));
+        let value: serde_json::Value =
+            serde_json::from_str(&render(&empty_report()).unwrap()).unwrap();
+        assert!(value.get("skipped").is_none(), "{value}");
+        // `coverage.skipped` is a different key and is always present.
+        assert_eq!(value["coverage"]["skipped"], serde_json::json!([]));
     }
 
     /// A report carrying no crosswalk emits no key for one.
@@ -296,11 +314,9 @@ mod tests {
                 value["crosswalks"][0]["framework"].as_str(),
                 Some(framework.id())
             );
-            assert!(
-                !value["crosswalks"][0]["groups"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
+            assert_ne!(
+                value["crosswalks"][0]["groups"].as_array().unwrap().len(),
+                0
             );
         }
     }
@@ -337,7 +353,7 @@ mod tests {
                 walk["disclaimer"].as_str(),
                 Some(crate::compliance::DISCLAIMER)
             );
-            assert!(!walk["standing"].as_str().unwrap().is_empty());
+            assert_ne!(walk["standing"].as_str().unwrap(), "");
         }
     }
 
@@ -383,6 +399,126 @@ mod tests {
             .get("findings")
             .and_then(serde_json::Value::as_array)
             .unwrap();
-        assert!(findings.is_empty());
+        assert_eq!(findings.as_slice(), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn a_partial_cve_status_serialises_with_its_counts() {
+        let report = report_with(CveStatus::Partial {
+            dependencies: 9,
+            incomplete: 2,
+        });
+        let value: serde_json::Value = serde_json::from_str(&render(&report).unwrap()).unwrap();
+        assert_eq!(
+            value["cve"],
+            serde_json::json!({"status": "partial", "dependencies": 9, "incomplete": 2})
+        );
+    }
+
+    #[test]
+    fn coverage_skips_carry_the_reason_as_data() {
+        let mut report = report_with(CveStatus::NoManifest);
+        report.skipped = vec![
+            crate::report::Skip::generated(
+                "web/bundle.js".to_owned(),
+                "minified, 65536 bytes per line on average over the first 65536 bytes".to_owned(),
+            ),
+            crate::report::Skip::unparseable("broken.py".to_owned()),
+        ];
+        report.coverage.skipped = report
+            .skipped
+            .iter()
+            .map(crate::report::CoveredSkip::from)
+            .collect();
+
+        let value: serde_json::Value = serde_json::from_str(&render(&report).unwrap()).unwrap();
+        let skipped = value["coverage"]["skipped"].as_array().unwrap();
+
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0]["path"], "web/bundle.js");
+        assert_eq!(skipped[0]["reason"], "generated");
+        assert_ne!(skipped[0]["detail"].as_str().unwrap(), "");
+        assert_eq!(
+            skipped[1],
+            serde_json::json!({"path": "broken.py", "reason": "unparseable"})
+        );
+        // The published array is untouched by the structured one.
+        assert!(value["skipped"][1].is_string());
+    }
+
+    #[test]
+    fn every_skip_reason_serialises_in_snake_case() {
+        use crate::report::SkipReason;
+        let reasons = [
+            (SkipReason::Excluded, "excluded"),
+            (SkipReason::IgnoreFile, "ignore_file"),
+            (SkipReason::Generated, "generated"),
+            (SkipReason::Unreadable, "unreadable"),
+            (SkipReason::Unparseable, "unparseable"),
+            (SkipReason::Unpinned, "unpinned"),
+            (SkipReason::Unstated, "unstated"),
+        ];
+        for (reason, name) in reasons {
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn a_report_without_a_coverage_key_still_deserialises() {
+        let older: serde_json::Value = serde_json::from_str(CONTRACT).unwrap();
+        let mut older = older;
+        older.as_object_mut().unwrap().remove("coverage");
+
+        let report: crate::report::Report = serde_json::from_value(older).unwrap();
+
+        assert_eq!(report.coverage, crate::report::Coverage::default());
+    }
+
+    #[test]
+    fn coverage_remote_servers_serialise_as_data_and_vanish_when_empty() {
+        use crate::report::{RemoteServer, RemoteStatus};
+        let mut report = report_with(CveStatus::NoManifest);
+        let value: serde_json::Value = serde_json::from_str(&render(&report).unwrap()).unwrap();
+        assert!(value["coverage"].get("remote_servers").is_none());
+
+        let server = |name: &str, status, tools| RemoteServer {
+            file: "mcp.json".to_owned(),
+            server: name.to_owned(),
+            status,
+            tools,
+        };
+        report.coverage.remote_servers = vec![
+            server("docs", RemoteStatus::Inspected, Some(3)),
+            server("local", RemoteStatus::NotPublic, None),
+            server("keyed", RemoteStatus::NeedsCredentials, None),
+            server("cmd", RemoteStatus::Unsupported, None),
+            server("down", RemoteStatus::Unreachable, None),
+            server("held", RemoteStatus::Offline, None),
+        ];
+        let value: serde_json::Value = serde_json::from_str(&render(&report).unwrap()).unwrap();
+        let entries = value["coverage"]["remote_servers"].as_array().unwrap();
+        assert_eq!(
+            entries[0],
+            serde_json::json!({"file": "mcp.json", "server": "docs", "status": "inspected", "tools": 3})
+        );
+        let statuses: Vec<&str> = entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                "inspected",
+                "not_public",
+                "needs_credentials",
+                "unsupported",
+                "unreachable",
+                "offline"
+            ]
+        );
+        assert!(entries[1..].iter().all(|e| e.get("tools").is_none()));
+
+        let back: crate::report::Report = serde_json::from_value(value).unwrap();
+        assert_eq!(back.coverage.remote_servers, report.coverage.remote_servers);
     }
 }

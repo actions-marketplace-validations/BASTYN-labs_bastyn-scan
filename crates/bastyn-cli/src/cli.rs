@@ -132,6 +132,70 @@ pub(crate) enum FailOn {
 pub(crate) enum Command {
     /// Scan a repository for AI and agentic security issues.
     Scan(ScanArgs),
+
+    /// Print the project ID that scans of a directory report under.
+    ///
+    /// Reads the directory's git configuration and never runs `git`, writes
+    /// no file and uses no network.
+    ProjectId(ProjectIdArgs),
+
+    /// Connect to an MCP server and write its tool list to a snapshot file.
+    ///
+    /// This is the one command that connects to a server you name, or starts
+    /// a command from a config file, and only when you run it. `scan` connects
+    /// to MCP servers only with `--inspect-remote`.
+    InspectServer(InspectServerArgs),
+}
+
+/// Arguments for `bastyn inspect-server`.
+#[derive(Debug, Args)]
+pub(crate) struct InspectServerArgs {
+    /// URL of a Streamable HTTP server.
+    #[arg(long, conflicts_with = "config", required_unless_present = "config")]
+    pub(crate) url: Option<String>,
+
+    /// Request header for `--url`, as `Name: value`. Repeatable.
+    #[arg(long = "header", value_name = "NAME: VALUE", requires = "url", value_parser = parse_header)]
+    pub(crate) headers: Vec<(String, String)>,
+
+    /// MCP config file holding the server entry.
+    #[arg(long, value_name = "FILE", requires = "server")]
+    pub(crate) config: Option<PathBuf>,
+
+    /// Name of the server entry in `--config`.
+    #[arg(long, value_name = "NAME", requires = "config", conflicts_with = "url")]
+    pub(crate) server: Option<String>,
+
+    /// Allow starting the entry's command. Without it a `command` entry is
+    /// refused and nothing runs.
+    #[arg(long, requires = "config", conflicts_with = "url")]
+    pub(crate) allow_spawn: bool,
+
+    /// Write the snapshot here instead of standard output.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) out: Option<PathBuf>,
+}
+
+/// Split `Name: value` into its two halves.
+fn parse_header(text: &str) -> Result<(String, String), String> {
+    match text.split_once(':') {
+        Some((name, value)) if !name.trim().is_empty() => {
+            Ok((name.trim().to_owned(), value.trim().to_owned()))
+        }
+        _ => Err("expected `Name: value`".to_owned()),
+    }
+}
+
+/// Arguments for `bastyn project-id`.
+#[derive(Debug, Args)]
+pub(crate) struct ProjectIdArgs {
+    /// Directory to resolve the project ID for.
+    #[arg(default_value = ".", value_name = "PATH")]
+    pub(crate) path: PathBuf,
+
+    /// Also print how the ID was derived and exactly what was hashed.
+    #[arg(long)]
+    pub(crate) explain: bool,
 }
 
 /// Arguments for `bastyn scan`.
@@ -177,9 +241,37 @@ pub(crate) struct ScanArgs {
     #[arg(long)]
     pub(crate) show_observations: bool,
 
-    /// Skip the CVE lookup, the only step that uses the network.
+    /// List every file the scan read, grouped by kind.
+    ///
+    /// Without this flag the text report prints only a one-line count of each
+    /// kind. This affects `--format text` only: JSON and SARIF output,
+    /// findings, counts and exit codes are the same either way.
+    #[arg(long)]
+    pub(crate) show_coverage: bool,
+
+    /// Skip the CVE lookup, and do not send the anonymous scan summary. It
+    /// also overrides --inspect-remote.
     #[arg(long)]
     pub(crate) offline: bool,
+
+    #[arg(
+        long,
+        help = "Do not send the anonymous scan summary. Reporting also stops with --offline, or when DO_NOT_TRACK is set to a value other than 0"
+    )]
+    pub(crate) no_reporting: bool,
+
+    /// Connect to the public https MCP servers named in config files and
+    /// check the tools they list. Off by default: a scan otherwise contacts
+    /// no MCP server. Entries with headers, credentials in the URL or
+    /// placeholders, commands, and non-public addresses are never contacted. `--offline` overrides this
+    /// flag. Servers that are not contacted are listed under Coverage gaps.
+    #[arg(long)]
+    pub(crate) inspect_remote: bool,
+
+    /// With --inspect-remote, write each inspected server's tool list to DIR
+    /// as *.bastyn-tools.json.
+    #[arg(long, value_name = "DIR", requires = "inspect_remote")]
+    pub(crate) save_snapshots: Option<std::path::PathBuf>,
 
     /// Do not scan paths matching GLOB. Repeatable.
     ///
@@ -221,8 +313,18 @@ pub(crate) struct ScanArgs {
 mod tests {
     use clap::{CommandFactory as _, Parser as _};
 
-    use super::{Cli, Command, GroupBy};
+    use super::{Cli, Command, GroupBy, ProjectIdArgs, ScanArgs};
     use bastyn_core::Framework;
+
+    /// The `scan` arguments of a parsed command line.
+    fn scan_args(cli: &Cli) -> &ScanArgs {
+        match &cli.command {
+            Command::Scan(args) => args,
+            Command::ProjectId(_) | Command::InspectServer(_) => {
+                unreachable!("these tests parse `scan`")
+            }
+        }
+    }
 
     /// Exactly one `--group-by` value is not a crosswalk, and it is the
     /// default.
@@ -233,7 +335,7 @@ mod tests {
     #[test]
     fn the_default_grouping_is_the_one_that_existed_before_the_flag() {
         let cli = Cli::parse_from(["bastyn", "scan"]);
-        let Command::Scan(args) = &cli.command;
+        let args = scan_args(&cli);
         assert_eq!(args.group_by, GroupBy::Layer);
         assert_eq!(args.group_by.framework(), None);
     }
@@ -252,7 +354,7 @@ mod tests {
             ("nist-genai", Framework::NistGenAi),
         ] {
             let cli = Cli::parse_from(["bastyn", "scan", "--group-by", typed]);
-            let Command::Scan(args) = &cli.command;
+            let args = scan_args(&cli);
             assert_eq!(
                 args.group_by.framework(),
                 Some(framework),
@@ -271,7 +373,7 @@ mod tests {
     fn no_framework_is_unreachable_from_the_command_line() {
         for framework in Framework::ALL {
             let cli = Cli::parse_from(["bastyn", "scan", "--group-by", framework.id()]);
-            let Command::Scan(args) = &cli.command;
+            let args = scan_args(&cli);
             assert_eq!(args.group_by.framework(), Some(framework));
         }
     }
@@ -310,5 +412,36 @@ mod tests {
             .to_string();
         assert!(error.contains("eu-ai-act"), "{error}");
         assert!(error.contains("layer"), "{error}");
+    }
+
+    /// Reporting is on unless the flag is given, and the flag does not touch
+    /// `--offline`.
+    #[test]
+    fn no_reporting_is_a_separate_opt_out() {
+        let cli = Cli::parse_from(["bastyn", "scan"]);
+        assert!(!scan_args(&cli).no_reporting);
+        assert!(!scan_args(&cli).offline);
+
+        let cli = Cli::parse_from(["bastyn", "scan", "--no-reporting"]);
+        assert!(scan_args(&cli).no_reporting);
+        assert!(!scan_args(&cli).offline);
+    }
+
+    /// `project-id` defaults to the current directory and takes `--explain`.
+    #[test]
+    fn project_id_arguments_parse() {
+        let cli = Cli::parse_from(["bastyn", "project-id"]);
+        let Command::ProjectId(ProjectIdArgs { path, explain }) = &cli.command else {
+            unreachable!("parsed `project-id`");
+        };
+        assert_eq!(path.as_os_str(), ".");
+        assert!(!explain);
+
+        let cli = Cli::parse_from(["bastyn", "project-id", "some/dir", "--explain"]);
+        let Command::ProjectId(ProjectIdArgs { path, explain }) = &cli.command else {
+            unreachable!("parsed `project-id`");
+        };
+        assert_eq!(path.as_os_str(), "some/dir");
+        assert!(explain);
     }
 }

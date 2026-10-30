@@ -22,7 +22,7 @@
 //! | `BAS-INFRA-003` | A volume mounting `/var/run/docker.sock` | defect | `ZT3` |
 //! | `BAS-INFRA-004` | `privileged: true` | defect | `ZT3` |
 //! | `BAS-INFRA-005` | `network_mode: host` | observation | `ZT3` |
-//! | `BAS-INFRA-006` | A hardcoded password/secret/token in `ENV`/`ARG` or Compose `environment:` | defect | `ZT1` |
+//! | `BAS-INFRA-006` | A hardcoded password/secret/token in `ENV`/`ARG` or Compose `environment:` | observation | `ZT1` |
 //! | `BAS-INFRA-010` | `pid: host` | observation | `ZT3` |
 //!
 //! # ZT3.1 and ZT3.2 are mostly already here
@@ -53,6 +53,8 @@
 
 mod compose;
 mod dockerfile;
+
+pub(crate) use compose::DOCKER_SOCKET;
 
 use std::path::Path;
 
@@ -139,28 +141,42 @@ fn is_dockerfile_name(lower_name: &str) -> bool {
     !NEVER_DOCKERFILE_EXTENSIONS.contains(&extension)
 }
 
+/// Why [`inspect`] could not analyse a file it claims.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InfraError {
+    /// A Compose file is not valid YAML, so none of its services were
+    /// checked.
+    #[error("the Compose file is not valid YAML")]
+    UnparseableCompose,
+}
+
 /// Inspect one container configuration file. `relative_path` is used in
 /// findings, and its file name selects the analyser.
 ///
-/// Returns findings directly rather than the `Result` [`crate::mcp::inspect`]
-/// carries. There is no I/O here, and unlike an MCP config — whose name
-/// promises a schema, so a file that does not parse is itself worth reporting
-/// as `BAS-MCP-000` — a Dockerfile or Compose file we cannot read is simply
-/// skipped. Nothing this function does can fail, so nothing calls for an error
-/// channel.
+/// A Dockerfile is never an error: there is no I/O here, and a Dockerfile we
+/// cannot make sense of still yields whatever findings its own checks could
+/// establish. A Compose file that does not parse is different — unlike an
+/// MCP config, whose name promises a schema and is itself worth reporting as
+/// `BAS-MCP-000`, a Compose file's checks simply have no services to look
+/// at — but the scan still needs to know it did not get to check the file,
+/// so the caller can list it as skipped rather than count it as covered.
 ///
-/// A path this module does not claim yields nothing, so a caller that has not
-/// consulted [`is_infra_file`] still gets a correct answer.
-#[must_use]
-pub fn inspect(relative_path: &Path, contents: &str) -> Vec<Finding> {
+/// A path this module does not claim yields `Ok(Vec::new())`, so a caller
+/// that has not consulted [`is_infra_file`] still gets a correct answer.
+pub fn inspect(relative_path: &Path, contents: &str) -> Result<Vec<Finding>, InfraError> {
     match kind_of(relative_path) {
-        Some(FileKind::Dockerfile) => dockerfile::run_all(relative_path, contents),
+        Some(FileKind::Dockerfile) => Ok(dockerfile::run_all(relative_path, contents)),
         Some(FileKind::Compose) => compose::run_all(relative_path, contents),
-        None => Vec::new(),
+        None => Ok(Vec::new()),
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "a failed assumption in a test should fail the test"
+)]
 mod tests {
     use super::*;
 
@@ -168,6 +184,7 @@ mod tests {
 
     fn rules(name: &str, contents: &str) -> Vec<String> {
         inspect(Path::new(name), contents)
+            .unwrap()
             .into_iter()
             .map(|finding| finding.rule_id)
             .collect()
@@ -282,6 +299,31 @@ mod tests {
     }
 
     #[test]
+    fn a_compose_file_that_is_not_yaml_is_an_error() {
+        let result = inspect(
+            Path::new("compose.yaml"),
+            "services:\n  app: [\n    privileged: true\n",
+        );
+        assert_eq!(result, Err(InfraError::UnparseableCompose));
+    }
+
+    #[test]
+    fn an_empty_compose_file_is_silent_not_an_error() {
+        assert_eq!(inspect(Path::new("compose.yaml"), ""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_compose_file_without_services_is_silent_not_an_error() {
+        assert_eq!(
+            inspect(
+                Path::new("docker-compose.yml"),
+                "version: '3'\nx-anchors: {}\n"
+            ),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
     fn a_dockerfile_is_routed_to_the_dockerfile_checks() {
         let contents =
             "FROM python:3.12\nENV OPENAI_API_KEY=sk-proj-9f2b7d41c6a8e35019bd\nUSER root\n";
@@ -304,7 +346,10 @@ mod tests {
 
     #[test]
     fn an_unclaimed_path_yields_nothing_even_with_dockerfile_content() {
-        assert!(rules("notes.md", "FROM python:3.12\nUSER root\n").is_empty());
+        assert_eq!(
+            rules("notes.md", "FROM python:3.12\nUSER root\n"),
+            Vec::<String>::new()
+        );
     }
 
     /// The precision-preserving decision in this module, asserted rather than
@@ -320,7 +365,7 @@ mod tests {
             ),
         ];
         for (name, contents) in observation_rules {
-            let findings = inspect(Path::new(name), contents);
+            let findings = inspect(Path::new(name), contents).unwrap();
             assert!(
                 findings.iter().all(|f| f.kind == Kind::Observation),
                 "{name}: {findings:#?}"
@@ -339,7 +384,7 @@ mod tests {
             ),
         ];
         for (name, contents) in defect_rules {
-            let findings = inspect(Path::new(name), contents);
+            let findings = inspect(Path::new(name), contents).unwrap();
             assert!(!findings.is_empty(), "{name} produced nothing");
             assert!(
                 findings.iter().all(|f| f.kind == Kind::Defect),
@@ -366,7 +411,7 @@ mod tests {
             ),
         ];
         for (name, contents) in samples {
-            for finding in inspect(Path::new(name), contents) {
+            for finding in inspect(Path::new(name), contents).unwrap() {
                 assert!(!finding.categories.is_empty(), "{finding:#?}");
                 if finding.kind == Kind::Defect {
                     assert!(

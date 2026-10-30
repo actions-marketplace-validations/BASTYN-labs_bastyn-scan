@@ -116,7 +116,88 @@ struct KnownFalsePositive {
 ///
 /// Entries marked `requires_network` are excluded: they are measurement limits
 /// of an offline gate, not things the scanner cannot detect.
-const MAX_KNOWN_GAPS: usize = 13;
+const MAX_KNOWN_GAPS: usize = 17;
+// Raised from 16 to 17 on 2026-09-28, admitting one deliberate new gap: a
+// known_gap entry for
+// vulnerable/real_misses/shell_command_via_thread_pool_forward.py.
+// collect_entry_point_forwards's callee-shape recognition (bare NAME(...) or
+// self/cls-qualified NAME(...)) does not cover a thread-pool/executor call
+// (asyncio.to_thread(_exec, cmd), pool.submit(_exec, cmd)), an unbound-method
+// call (Class._exec(self, cmd)), or a super() call (super()._exec(cmd)); the
+// space of ways a callable and its argument can be passed along elsewhere is
+// open-ended, so this is recorded rather than special-cased further; see
+// bastyn.yml's comment on BAS-LLM10-009 for the full writeup.
+//
+// Raised from 15 to 16 on 2026-09-28, admitting one deliberate new gap: a
+// known_gap entry for
+// vulnerable/real_misses/shell_command_via_chained_tool_forward.py.
+// BAS-LLM10-009's flow.passthrough_downgrade clause forwards a tool's own
+// parameter through collect_entry_point_forwards
+// (crates/bastyn-core/src/flow/graph.rs) only one hop deep, through a bare
+// local-function call or a same-instance self/cls-qualified method call --
+// the same bounded-depth precedent FlowGraph::wrapper_sink_parameters's own
+// doc comment already accepts on the sink side ("a wrapper around a wrapper
+// is out of reach by construction, not merely untested"). A parameter
+// forwarded through a second local function before reaching the
+// shell-command helper (@mcp.tool() run(cmd) -> _outer(cmd) -> _inner(cmd))
+// is invisible to it, so the helper is wrongly reported as an observation
+// instead of a defect. Extending this to arbitrary-depth call chains is
+// materially larger in scope than the rest of this check -- recorded here
+// rather than attempted. See bastyn.yml's comment on BAS-LLM10-009 for the
+// full writeup.
+//
+// Raised from 14 to 15 on 2026-09-24, admitting one deliberate new gap: a
+// known_gap entry for vulnerable/real_misses/shell_command_via_mutated_registry.py,
+// found during the final review of this round's precision fixes.
+// BAS-LLM10-009's exclude_if: closed_value clause resolves a module-level
+// dict/list as permanently `closed: true` once it sees the literal
+// initializer, because crates/bastyn-core/src/flow/graph.rs's
+// Analyzer::bind_targets only records a binding for a plain-identifier
+// assignment target -- a subscript target (COMMANDS[name] = cmd) or an
+// attribute-call receiver (CMDS.append(x)) both fall through its `_ => {}`
+// arm and record no binding at all, so the graph never learns the
+// container is mutated after its own definition. Fixing this properly
+// needs the graph to track mutated container names through subscript and
+// attribute-call targets, a materially larger change than this fix wave's
+// scope (which was five specific, bounded review findings) -- recorded
+// here rather than attempted.
+//
+// Lowered from 15 to 14 on 2026-09-23, the direction this constant exists to
+// reward: the known_gap entry for vulnerable/real_misses/sql_from_tool_parameter.py
+// (sql = f"...{query}%'"; cursor.execute(sql), where `query` is an
+// @tool-decorated MCP handler's own parameter) was promoted to [[expect]]
+// alongside the new BAS-LLM10-018 rule (unparameterized query assigned to a
+// local variable then executed). BAS-LLM10-018 catches the interpolate-then-
+// execute shape unconditionally, without needing the new SourceKind plus
+// decorator-recognition pass that flow-based Origin::Parameter tracking would
+// have required -- it never asks where the interpolated value came from, only
+// whether an f-string-built local is executed on the very next line. This is
+// not a loosened guardrail: a real gap closed, so the ceiling it is measured
+// against closes with it.
+//
+// Raised from 14 to 15 on 2026-09-23, admitting one deliberate new gap: a
+// known_gap entry for vulnerable/real_misses/path_traversal_variable_then_open.py,
+// documenting a distinct BAS-LLM10-012 miss from the bare-parameter gap below --
+// here the path *is* assembled with os.path.join(...), but in a separate
+// statement (`path = os.path.join(...)`) before `open(path)`. The rule's
+// metavariable_matches only ever inspects the literal text of the $ARG node
+// captured at the open() call site itself, with no dataflow/definition
+// resolution, so it cannot see the join that happened one line earlier. Added
+// alongside a tightened BAS-LLM10-012 `description:` making this inline-argument
+// requirement explicit, per a task reviewer finding that the prior wording
+// overclaimed what the pattern detects.
+//
+// Raised from 13 to 14 on 2026-09-23, admitting one deliberate new gap: a
+// known_gap entry for vulnerable/real_misses/path_traversal_bare_parameter.py,
+// added alongside the new BAS-LLM10-012 rule (a file opened at an unresolved
+// path built by joining or interpolating a non-literal value). BAS-LLM10-012
+// gates on the open() argument's own text looking like os.path.join(...), an
+// f-string, or a concatenation -- the signal that the path was assembled
+// from more than one piece -- and has nothing to match against a bare
+// parameter passed straight to open() with no assembly at all. Catching that
+// would need a bare-identifier-is-this-function's-own-parameter check or
+// real dataflow tracing, not attempted here.
+//
 // Raised from 12 to 13 on 2026-09-22, admitting one deliberate new gap: a
 // known_gap entry for vulnerable/real_misses/sql_from_tool_parameter.py,
 // added alongside the new BAS-LLM10-008 rule (model output reaching SQL
@@ -251,7 +332,105 @@ const MAX_KNOWN_GAPS: usize = 13;
 /// Raising it means a rule started over-triggering on a new case that
 /// cannot currently be excluded precisely -- that needs a human decision in
 /// the PR description, not a silent bump, exactly like `MAX_KNOWN_GAPS`.
-const MAX_KNOWN_FALSE_POSITIVES: usize = 2;
+const MAX_KNOWN_FALSE_POSITIVES: usize = 5;
+// Folded in PR #25 (origin/main) on 2026-09-25, merged into release/0.1.8:
+// PR #25's provenance-tracing work fixed both of the pre-existing baseline's
+// known false positives in vulnerable/real_misses/eval_guarded_by_local_check.py
+// (the "2 on 2026-08-28" entry below), taking origin/main's own count from 2 to
+// 0. This branch's five entries admitted below (6-to-7, 4-to-6, and the
+// corrected/superseded 2-to-4 history) are untouched by that fix and still
+// apply, so the merged total reflects only the five entries this branch added
+// on top of a now-zero baseline.
+//
+// Raised from 6 to 7 on 2026-09-24 (final review of this same round),
+// admitting one more deliberate precision debt: a known_false_positive
+// entry for vulnerable/real_misses/sql_ddl_via_local_variable.py.
+// BAS-LLM10-018 has the same DDL-identifier false positive Finding 2 of
+// this review fixed for BAS-LLM10-017's same-node case, but -018 matches
+// the f-string's inner text as $$$FSTR, a variadic capture -- and a
+// metavariable_not_matches clause mirroring -017's fix was tried and
+// confirmed empirically (built and scanned) to never exclude anything,
+// because this engine's metavariable_not_matches only ever reads
+// MetaVarEnv's single_matched map, never multi_matched where a
+// $$$-bound capture lives. See bastyn.yml's comment on BAS-LLM10-018 for
+// the full investigation.
+//
+// Raised from 4 to 6 on 2026-09-24, admitting four new deliberate
+// precision debts: the four remaining false positives from the community
+// precision report that Tasks 4-7 did not close, each because closing it
+// properly needs an analysis materially larger than that round's scope --
+//
+//   - vulnerable/real_misses/shell_command_via_unreachable_function.py:21.
+//     BAS-LLM10-009 has no reachability analysis: whether anything in the
+//     program calls a function is a whole-program question this
+//     file-local structural rule cannot answer.
+//   - vulnerable/real_misses/shell_command_behind_disabled_flag.py:25.
+//     BAS-LLM10-009 has no constant-propagation or dead-branch analysis:
+//     it cannot prove a module-level boolean constant makes the branch
+//     containing the sink unreachable in the shipped version.
+//   - vulnerable/real_misses/path_traversal_parameter_with_literal_callers.py:21.
+//     BAS-LLM10-012's exclude_if: constant_path only resolves a
+//     module-level name's own assignment chain forward from its
+//     definition; proving that every caller of a function parameter
+//     passes a literal needs interprocedural call-site analysis, which
+//     it does not have.
+//   - vulnerable/real_misses/credential_default_echoed_as_client_credential.py:30
+//     (low confidence -- borderline, per the report itself). BAS-ZT1-020
+//     cannot tell a client script echoing a server's own documented
+//     default credential apart from a program defending its own weak
+//     default secret -- both are the identical
+//     os.environ.get(KEY, "real-looking-default") shape, and only
+//     call-context analysis (is the value sent, or compared/stored?)
+//     could tell them apart.
+//
+// This same pass also corrects the "Raised from 2 to 4 on 2026-09-23"
+// entry immediately below, which had gone stale: it names
+// vulnerable/real_misses/path_traversal_safe_local_constant.py and
+// vulnerable/real_misses/shell_command_via_local_variable.py as
+// currently-admitted precision debts and calls them unfixable without
+// real dataflow tracing. Both claims are now false -- Task 6 (commit
+// ec0fbdf) added BAS-LLM10-012's exclude_if: constant_path and Task 4
+// (commit 028d58c) added BAS-LLM10-009's exclude_if: [closed_value,
+// shell_quoted], and once the Tier-2 dataflow graph could prove each
+// value safe, both entries moved out of known_false_positive entirely --
+// see their `why` text under [[expect]] in tests/corpus/expected.toml.
+// Left uncorrected below for the historical record, per this constant's
+// own practice of not rewriting past entries (see the MAX_KNOWN_GAPS
+// 14-to-12 entry for the same pattern).
+//
+// Raised from 2 to 4 on 2026-09-23 (later corrected -- see the 4-to-6
+// entry above), admitting two deliberate new precision debts, both found
+// and fixed in the same final-review pass:
+//
+//   - vulnerable/real_misses/path_traversal_safe_local_constant.py:40
+//     (finding C1, part 2). BAS-LLM10-012's metavariable_not_matches
+//     exclusion, added in the same review pass, closes the *all-literal*
+//     os.path.join(...) false positive (a genuine contract violation --
+//     see the -3-to-2 history below this comment for context on why that
+//     part was a fix, not an admission). What it deliberately does not
+//     close is a join with one *safe local constant* argument (HERE =
+//     os.path.dirname(__file__)): HERE is a bare identifier, a genuine
+//     non-literal, so the rule fires exactly as its own contract says it
+//     should -- but it is not attacker-influenceable in practice, and
+//     same-node regex matching cannot tell that apart from a real
+//     non-literal without dataflow analysis. The same precision ceiling
+//     BAS-LLM10-009/-017/-018 already accept by design.
+//   - vulnerable/real_misses/shell_command_via_local_variable.py:32
+//     (finding I1). A fixed literal shell command held in a local variable
+//     one line above the subprocess.run(..., shell=True) call that
+//     consumes it. Identical sibling-statement blindness to the
+//     eval_guarded_by_local_check.py entries below: `none:` only matches
+//     alternate shapes of the matched node itself, never a prior sibling
+//     assignment.
+//
+// Neither was fixable without either narrowing the rule in a way that
+// risked swallowing a real non-literal command/path, or real dataflow
+// tracing -- not attempted in that pass, consistent with this whole rule
+// batch's deliberate unconditional/structural design (see the plan's
+// Architecture note in
+// docs/superpowers/plans/2026-09-23-recall-gap-detection-rules.md). Both
+// were fixed later regardless -- see the correction note above.
+//
 // 2 on 2026-08-28: split out of MAX_KNOWN_GAPS (see that constant's 14-to-12
 // history entry). Both entries are BAS-LLM10-004 flagging an eval()/exec()
 // call whose argument a human can see is safe by reading a sibling
@@ -259,6 +438,9 @@ const MAX_KNOWN_FALSE_POSITIVES: usize = 2;
 // `none:` (same-node only) and `inside:` (ancestors only) cannot reach. See
 // vulnerable/real_misses/eval_guarded_by_local_check.py's docstring and
 // bastyn.yml's comment on BAS-LLM10-004 for the investigation.
+//
+// Lowered on 2026-09-24: the flow graph now drops a closed value and a
+// `not in` allowlist-guarded value for BAS-LLM10-004.
 
 /// `crates/bastyn-core` -> `tests/corpus`.
 fn corpus_root() -> PathBuf {
@@ -300,6 +482,114 @@ fn matches(
         && rule.is_none_or(|wanted| finding.rule_id == wanted)
 }
 
+/// Where one finding lands in the manifest.
+///
+/// Checked in declaration order, so a finding that matches more than one
+/// kind of entry is counted once, at the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Matches an `[[expect]]` location (file, line, category, and rule
+    /// when the entry names one). Kind and severity are checked separately,
+    /// by `resolve_expect`.
+    Expect,
+    /// Matches a `[[known_false_positive]]`.
+    KnownFalsePositive,
+    /// Matches a `[[known_gap]]`: a gap that has started being caught.
+    KnownGap,
+    /// Matches nothing the manifest says. A gate failure unless the file is
+    /// an `[[expect_none]]` file, which `find_violations` already reports.
+    Unaccounted,
+}
+
+/// Classifies one finding against the manifest.
+fn classify(finding: &Finding, manifest: &Manifest) -> Class {
+    if manifest.expect.iter().any(|entry| {
+        matches(
+            finding,
+            &entry.file,
+            entry.line,
+            entry.category,
+            entry.rule.as_deref(),
+        )
+    }) {
+        return Class::Expect;
+    }
+    if manifest
+        .known_false_positive
+        .iter()
+        .any(|entry| matches(finding, &entry.file, entry.line, entry.category, None))
+    {
+        return Class::KnownFalsePositive;
+    }
+    if manifest
+        .known_gap
+        .iter()
+        .any(|gap| matches(finding, &gap.file, gap.line, gap.category, None))
+    {
+        return Class::KnownGap;
+    }
+    Class::Unaccounted
+}
+
+/// Findings no manifest entry accounts for, outside `[[expect_none]]` files
+/// (those are reported as violations instead, so nothing is reported twice).
+fn find_unaccounted<'a>(manifest: &Manifest, findings: &'a [Finding]) -> Vec<&'a Finding> {
+    findings
+        .iter()
+        .filter(|finding| classify(finding, manifest) == Class::Unaccounted)
+        .filter(|finding| {
+            !manifest
+                .expect_none
+                .iter()
+                .any(|entry| same_path(&finding.location.file, &entry.file))
+        })
+        .collect()
+}
+
+/// How many of the scan's defect findings the manifest says are real.
+struct DefectPrecision {
+    /// Defect findings that are correct.
+    correct: usize,
+    /// Every defect finding the scan returned.
+    returned: usize,
+}
+
+/// Defect precision on this corpus: of the defects the scan returned, how
+/// many the manifest says are real.
+///
+/// A defect is correct when it matches an `[[expect]]` entry whose own kind
+/// is `defect`, or a `[[known_gap]]` (a real defect we did not expect to
+/// catch yet). Known false positives stay in the denominator: they are
+/// defects the scan returned and should not have.
+fn defect_precision(findings: &[Finding], manifest: &Manifest) -> DefectPrecision {
+    let defects: Vec<&Finding> = findings
+        .iter()
+        .filter(|finding| finding.kind == Kind::Defect)
+        .collect();
+    let correct = defects
+        .iter()
+        .filter(|finding| {
+            manifest.expect.iter().any(|entry| {
+                entry.kind == Kind::Defect
+                    && matches(
+                        finding,
+                        &entry.file,
+                        entry.line,
+                        entry.category,
+                        entry.rule.as_deref(),
+                    )
+            }) || manifest
+                .known_gap
+                .iter()
+                .any(|gap| matches(finding, &gap.file, gap.line, gap.category, None))
+        })
+        .count();
+    DefectPrecision {
+        correct,
+        returned: defects.len(),
+    }
+}
+
 /// A percentage, or `None` when there is nothing to divide by — not a
 /// failure, just nothing measured yet.
 #[expect(
@@ -319,63 +609,107 @@ fn format_percentage(value: Option<f64>) -> String {
 }
 
 /// One `[[expect]]` entry, resolved against the scan.
-enum ExpectOutcome<'a> {
+enum ExpectOutcome<'a, 'f> {
     /// The referenced file is not on disk yet.
     Pending(&'a Expect),
-    /// The file exists and a finding matched.
+    /// A finding at this location has the expected kind and severity.
     Matched,
+    /// Findings exist at this location, but none has the expected kind and
+    /// severity. `finding` is the first of them, for the report.
+    Mismatched {
+        entry: &'a Expect,
+        finding: &'f Finding,
+    },
     /// The file exists and nothing matched: a recall failure.
     Missing(&'a Expect),
 }
 
-fn resolve_expect<'a>(root: &Path, entry: &'a Expect, findings: &[Finding]) -> ExpectOutcome<'a> {
+fn resolve_expect<'a, 'f>(
+    root: &Path,
+    entry: &'a Expect,
+    findings: &'f [Finding],
+) -> ExpectOutcome<'a, 'f> {
     if !root.join(&entry.file).exists() {
         return ExpectOutcome::Pending(entry);
     }
-    let found = findings.iter().any(|finding| {
-        matches(
-            finding,
-            &entry.file,
-            entry.line,
-            entry.category,
-            entry.rule.as_deref(),
-        )
-    });
-    if found {
-        ExpectOutcome::Matched
-    } else {
-        ExpectOutcome::Missing(entry)
+    let located: Vec<&Finding> = findings
+        .iter()
+        .filter(|finding| {
+            matches(
+                finding,
+                &entry.file,
+                entry.line,
+                entry.category,
+                entry.rule.as_deref(),
+            )
+        })
+        .collect();
+    match located.first() {
+        None => ExpectOutcome::Missing(entry),
+        Some(_)
+            if located.iter().any(|finding| {
+                finding.kind == entry.kind && finding.severity == entry.severity
+            }) =>
+        {
+            ExpectOutcome::Matched
+        }
+        Some(first) => ExpectOutcome::Mismatched {
+            entry,
+            finding: first,
+        },
     }
 }
 
 /// The `[[expect]]` list, resolved against one scan.
 #[derive(Default)]
-struct ExpectSummary<'a> {
-    /// Entries whose file exists on disk (whether matched or not).
-    ready: usize,
-    /// Ready entries with a matching finding.
-    matched: usize,
+struct ExpectSummary<'a, 'f> {
+    /// Ready `defect` entries, and how many of them matched.
+    ready_defects: usize,
+    /// Ready `defect` entries with a matching finding.
+    matched_defects: usize,
+    /// Ready `observation` entries, and how many of them matched.
+    ready_observations: usize,
+    /// Ready `observation` entries with a matching finding.
+    matched_observations: usize,
     /// Entries whose file is not on disk yet.
     pending: Vec<&'a Expect>,
     /// Ready entries with no matching finding: a recall failure.
     missing: Vec<&'a Expect>,
+    /// Entries located at the right place with the wrong kind or severity.
+    mismatched: Vec<(&'a Expect, &'f Finding)>,
 }
 
-fn resolve_expects<'a>(
+fn resolve_expects<'a, 'f>(
     root: &Path,
     expect: &'a [Expect],
-    findings: &[Finding],
-) -> ExpectSummary<'a> {
+    findings: &'f [Finding],
+) -> ExpectSummary<'a, 'f> {
     let mut summary = ExpectSummary::default();
     for entry in expect {
         match resolve_expect(root, entry, findings) {
             ExpectOutcome::Pending(entry) => summary.pending.push(entry),
-            ExpectOutcome::Matched => {
-                summary.matched += 1;
-                summary.ready += 1;
+            ExpectOutcome::Matched => match entry.kind {
+                Kind::Defect => {
+                    summary.ready_defects += 1;
+                    summary.matched_defects += 1;
+                }
+                Kind::Observation => {
+                    summary.ready_observations += 1;
+                    summary.matched_observations += 1;
+                }
+            },
+            ExpectOutcome::Mismatched { entry, finding } => {
+                match entry.kind {
+                    Kind::Defect => summary.ready_defects += 1,
+                    Kind::Observation => summary.ready_observations += 1,
+                }
+                summary.mismatched.push((entry, finding));
             }
             ExpectOutcome::Missing(entry) => {
-                summary.ready += 1;
+                match entry.kind {
+                    Kind::Defect => summary.ready_defects += 1,
+                    Kind::Observation => summary.ready_observations += 1,
+                }
                 summary.missing.push(entry);
             }
         }
@@ -441,28 +775,31 @@ fn find_resolved_false_positives<'a>(
 /// The report `FORMAT.md` specifies, plus a note when the corpus is not
 /// fully written yet. Always printed, pass or fail.
 fn print_summary(
-    summary: &ExpectSummary<'_>,
-    unexpected: usize,
+    summary: &ExpectSummary<'_, '_>,
+    precision: &DefectPrecision,
+    unaccounted: usize,
     gaps: GapCounts,
     false_positives: usize,
 ) {
-    let pending = summary.pending.len();
-    if summary.ready == 0 && pending > 0 {
-        println!(
-            "corpus: 0/0 planted defects found   (n/a — {pending} pending, corpus not yet written)"
-        );
-    } else {
-        println!(
-            "corpus: {}/{} planted defects found   (found {})",
-            summary.matched,
-            summary.ready,
-            format_percentage(percentage(summary.matched, summary.ready))
-        );
-    }
     println!(
-        "        {unexpected} unexpected finding{}             (precision {})",
-        if unexpected == 1 { "" } else { "s" },
-        format_percentage(percentage(summary.matched, summary.matched + unexpected)),
+        "corpus: {}/{} expected defects found        (recall on this corpus {})",
+        summary.matched_defects,
+        summary.ready_defects,
+        format_percentage(percentage(summary.matched_defects, summary.ready_defects))
+    );
+    println!(
+        "        {}/{} expected observations found",
+        summary.matched_observations, summary.ready_observations
+    );
+    println!(
+        "        {}/{} defects returned are expected   (defect precision on this corpus {}, known false positives included)",
+        precision.correct,
+        precision.returned,
+        format_percentage(percentage(precision.correct, precision.returned))
+    );
+    println!(
+        "        {unaccounted} unaccounted finding{}",
+        if unaccounted == 1 { "" } else { "s" }
     );
     println!(
         "        {} known gap{}{}",
@@ -605,6 +942,66 @@ fn print_violations(violations: &[Violation<'_>]) -> Vec<String> {
         .collect()
 }
 
+/// Prints `[[expect]]` entries located at the right place with the wrong
+/// kind or severity, and returns one failure line per entry.
+fn print_mismatched(mismatched: &[(&Expect, &Finding)]) -> Vec<String> {
+    if mismatched.is_empty() {
+        return Vec::new();
+    }
+    println!("\nmismatched expectations (wrong kind or severity):");
+    mismatched
+        .iter()
+        .map(|(entry, finding)| {
+            let line = format!(
+                "  {}:{} [{}] rule={} expected kind={:?} severity={:?}, got kind={:?} severity={:?}",
+                entry.file,
+                entry.line,
+                entry.category,
+                finding.rule_id,
+                entry.kind,
+                entry.severity,
+                finding.kind,
+                finding.severity
+            );
+            println!("{line}");
+            line
+        })
+        .collect()
+}
+
+/// Prints findings no manifest entry accounts for, and returns one failure
+/// line per finding.
+fn print_unaccounted(unaccounted: &[&Finding]) -> Vec<String> {
+    if unaccounted.is_empty() {
+        return Vec::new();
+    }
+    println!(
+        "\nunaccounted findings (match no [[expect]], [[known_false_positive]] or [[known_gap]]):"
+    );
+    unaccounted
+        .iter()
+        .map(|finding| {
+            let categories = finding
+                .categories
+                .iter()
+                .map(|category| category.id())
+                .collect::<Vec<_>>()
+                .join(",");
+            let line = format!(
+                "  {}:{} [{categories}] rule={} kind={:?} severity={:?} — {}",
+                finding.location.file.display(),
+                finding.location.line,
+                finding.rule_id,
+                finding.kind,
+                finding.severity,
+                finding.title
+            );
+            println!("{line}");
+            line
+        })
+        .collect()
+}
+
 #[test]
 fn corpus_gate() -> Result<(), String> {
     let root = corpus_root();
@@ -636,10 +1033,13 @@ fn corpus_gate() -> Result<(), String> {
     let promotable = find_promotable(&manifest.known_gap, &report.findings);
     let resolved_false_positives =
         find_resolved_false_positives(&manifest.known_false_positive, &report.findings);
+    let unaccounted = find_unaccounted(&manifest, &report.findings);
+    let precision = defect_precision(&report.findings, &manifest);
 
     print_summary(
         &summary,
-        violations.len(),
+        &precision,
+        unaccounted.len(),
         GapCounts::of(&manifest.known_gap),
         manifest.known_false_positive.len(),
     );
@@ -651,6 +1051,8 @@ fn corpus_gate() -> Result<(), String> {
 
     let mut failures = print_missing(&summary.missing);
     failures.extend(print_violations(&violations));
+    failures.extend(print_mismatched(&summary.mismatched));
+    failures.extend(print_unaccounted(&unaccounted));
 
     if failures.is_empty() {
         Ok(())
@@ -763,6 +1165,152 @@ mod tests {
         }
     }
 
+    fn finding_of_kind(
+        rule: &str,
+        file: &str,
+        line: usize,
+        category: Category,
+        kind: Kind,
+        severity: Severity,
+    ) -> Finding {
+        Finding {
+            kind,
+            severity,
+            ..finding(rule, file, line, category)
+        }
+    }
+
+    fn manifest(toml_text: &str) -> Manifest {
+        toml::from_str(toml_text).unwrap()
+    }
+
+    #[test]
+    fn a_finding_matching_nothing_is_unaccounted() {
+        let m = manifest("");
+        let f = finding("BAS-LLM10-001", "vulnerable/a.py", 9, Category::Llm10);
+        assert_eq!(classify(&f, &m), Class::Unaccounted);
+    }
+
+    #[test]
+    fn classification_prefers_expect_over_known_false_positive_and_known_gap() {
+        let m = manifest(
+            r#"
+            [[expect]]
+            file = "vulnerable/a.py"
+            line = 9
+            category = "LLM10"
+            kind = "defect"
+            severity = "critical"
+            why = "x"
+            [[known_gap]]
+            file = "vulnerable/a.py"
+            line = 9
+            category = "LLM10"
+            why = "x"
+            [[known_false_positive]]
+            file = "vulnerable/a.py"
+            line = 9
+            category = "LLM10"
+            why = "x"
+            "#,
+        );
+        let f = finding("BAS-LLM10-001", "vulnerable/a.py", 9, Category::Llm10);
+        assert_eq!(classify(&f, &m), Class::Expect);
+    }
+
+    #[test]
+    fn classification_prefers_known_false_positive_over_known_gap() {
+        let m = manifest(
+            r#"
+            [[known_gap]]
+            file = "vulnerable/a.py"
+            line = 9
+            category = "LLM10"
+            why = "x"
+            [[known_false_positive]]
+            file = "vulnerable/a.py"
+            line = 9
+            category = "LLM10"
+            why = "x"
+            "#,
+        );
+        let f = finding("BAS-LLM10-001", "vulnerable/a.py", 9, Category::Llm10);
+        assert_eq!(classify(&f, &m), Class::KnownFalsePositive);
+    }
+
+    #[test]
+    fn an_expect_whose_finding_has_another_kind_is_a_mismatch() {
+        let m = manifest(
+            r#"
+            [[expect]]
+            file = "vulnerable/a.py"
+            line = 9
+            category = "LLM10"
+            kind = "defect"
+            severity = "critical"
+            why = "x"
+            "#,
+        );
+        let f = finding_of_kind(
+            "BAS-LLM10-001",
+            "vulnerable/a.py",
+            9,
+            Category::Llm10,
+            Kind::Observation,
+            Severity::Critical,
+        );
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // `resolve_expect` treats a missing file as pending, so point it at a
+        // file that exists: this test file itself.
+        let mut entry = m.expect[0].clone();
+        entry.file = "tests/corpus_gate.rs".to_owned();
+        let mut located = f;
+        located.location.file = PathBuf::from("tests/corpus_gate.rs");
+        assert!(matches!(
+            resolve_expect(&root, &entry, std::slice::from_ref(&located)),
+            ExpectOutcome::Mismatched { .. }
+        ));
+    }
+
+    #[test]
+    fn defect_precision_counts_known_false_positives_as_wrong() {
+        let m = manifest(
+            r#"
+            [[expect]]
+            file = "vulnerable/a.py"
+            line = 1
+            category = "LLM10"
+            kind = "defect"
+            severity = "high"
+            why = "x"
+            [[known_false_positive]]
+            file = "vulnerable/b.py"
+            line = 2
+            category = "LLM10"
+            why = "x"
+            "#,
+        );
+        let right = finding("BAS-LLM10-004", "vulnerable/a.py", 1, Category::Llm10);
+        let wrong = finding("BAS-LLM10-004", "vulnerable/b.py", 2, Category::Llm10);
+        let precision = defect_precision(&[right, wrong], &m);
+        assert_eq!(precision.returned, 2);
+        assert_eq!(precision.correct, 1);
+    }
+
+    #[test]
+    fn an_observation_is_not_counted_in_defect_precision() {
+        let m = manifest("");
+        let f = finding_of_kind(
+            "BAS-LLM10-005",
+            "vulnerable/a.ts",
+            1,
+            Category::Llm10,
+            Kind::Observation,
+            Severity::High,
+        );
+        assert_eq!(defect_precision(&[f], &m).returned, 0);
+    }
+
     #[test]
     fn matches_on_file_line_and_category() {
         let f = finding("BAS-LLM10-001", "vulnerable/a.py", 9, Category::Llm10);
@@ -826,7 +1374,8 @@ mod tests {
 
     #[test]
     fn recall_and_precision_arithmetic() {
-        // 18/22 recall, 0 unexpected findings out of 18 true positives.
+        // 18/22 recall; 18/18 defect precision (every returned defect correct,
+        // none wrong or unaccounted for).
         assert_eq!(percentage(18, 22), Some(18.0 / 22.0 * 100.0));
         assert_eq!(percentage(18, 18), Some(100.0));
     }

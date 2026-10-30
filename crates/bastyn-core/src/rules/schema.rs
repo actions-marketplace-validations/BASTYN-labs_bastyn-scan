@@ -103,6 +103,23 @@ pub(crate) struct RuleDef {
     /// Only match when nested inside one of these patterns.
     #[serde(default)]
     pub(crate) inside: Vec<String>,
+    /// Drop a match when one of these patterns matches anywhere in the same
+    /// file with every metavariable it shares bound to the same text.
+    ///
+    /// `none` only sees the matched node and `inside` only its ancestors;
+    /// this reaches a sibling statement, such as the message that sends a
+    /// prompt in the user role rather than the system role.
+    #[serde(default)]
+    pub(crate) none_in_file: Vec<String>,
+    /// Keep a match only when one of these patterns matches anywhere in the
+    /// same file, with every metavariable it shares with `any` bound to the
+    /// same text.
+    ///
+    /// The positive twin of `none_in_file`: it anchors a rule to a file that
+    /// shows the context the rule is about (for example, that an HTTP
+    /// transport is built) before an otherwise ubiquitous call is reported.
+    #[serde(default)]
+    pub(crate) requires_in_file: Vec<String>,
     /// Captured metavariable name to the regex its text must match.
     #[serde(default)]
     pub(crate) metavariable_matches: HashMap<String, String>,
@@ -129,6 +146,18 @@ pub(crate) struct RuleDef {
     /// rather than in a single sweep, and when both are present both apply.
     #[serde(default)]
     pub(crate) flow: Option<FlowDef>,
+    /// Drop an otherwise-matching candidate when a targeted, Python-only
+    /// structural predicate proves the captured value is safe.
+    ///
+    /// Distinct from `flow:`: `flow:` is a *positive* requirement ("this
+    /// value must have come from an untrusted source"), which requires a
+    /// `source:` kind. This is a *negative* exclusion for a rule that, by
+    /// design, does not gate on provenance at all (`BAS-LLM10-009`,
+    /// `BAS-LLM10-012` drop the source-name gate the way `BAS-LLM10-004`
+    /// dropped it for eval/exec) but still recognises the handful of shapes
+    /// that are provably safe regardless of where the value came from.
+    #[serde(default)]
+    pub(crate) exclude_if: Option<ExcludeIfDef>,
     /// What is wrong and why it matters. Two sentences at most.
     pub(crate) description: String,
     /// What to do about it. Actionable, specific to this code.
@@ -137,15 +166,49 @@ pub(crate) struct RuleDef {
 
 /// A rule's `flow:` clause, exactly as written in YAML.
 ///
+/// Provenance-gated, the common case -- a value must trace to one of the
+/// listed sources:
+///
 /// ```yaml
 /// flow:
 ///   variable: ARG          # whose provenance to test; defaults to ARG
 ///   source: model_output   # one kind, or a list of them
 ///   unguarded: true        # and no guard may already dominate the sink
 ///   sink: code_execution   # also match calls to local wrappers of this sink
+///   builtin_callee: true   # drop a call through a locally rebound name
+///   unproven:               # report an untraceable value as an observation
+///     kind: observation
+///     requires:
+///       ARG: "(?i)(response|reply)"
 /// ```
+///
+/// Unconditional, when `source:` is left out entirely -- every non-closed,
+/// non-guarded value is proven regardless of where it came from, the same
+/// composition-is-the-defect philosophy `BAS-LLM10-009`/`-017`/`-018` already
+/// use without going through `flow:` at all:
+///
+/// ```yaml
+/// flow:
+///   variable: ARG
+///   unguarded: true        # a guard may still dominate the sink
+///   builtin_callee: true   # a locally rebound name is still not the builtin
+/// ```
+///
+/// `unproven:` only means something when there is a source requirement to
+/// fail: with no `source:`, every value that is not closed or guarded is
+/// already `Proven`, so pairing `unproven:` with an omitted `source:` is a
+/// load error (see [`super::error::RuleError::UnprovenWithoutSource`]).
+/// `sink:` is likewise rejected with no `source:` (see
+/// [`super::error::RuleError::FlowSinkWithoutSource`]): the wrapper-sink
+/// pass it enables would otherwise reach every wrapper call whose argument
+/// is merely not closed and not guarded, a materially broader and currently
+/// untested combination no shipped rule needs.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent clause a rule opts into in YAML; a state machine would obscure which ones a rule set"
+)]
 pub(crate) struct FlowDef {
     /// The captured metavariable whose provenance is tested.
     ///
@@ -156,7 +219,14 @@ pub(crate) struct FlowDef {
     pub(crate) variable: String,
     /// The source kinds the captured value must have come from. Written as a
     /// single kind or a list of them.
-    pub(crate) source: SourceSpec,
+    ///
+    /// Absent entirely, this clause does not gate on provenance at all: any
+    /// value that is not closed over literals this file fixes and (with
+    /// `unguarded: true`) not already dominated by a guard is proven,
+    /// whatever produced it. See this struct's own docs for when to reach
+    /// for this over a `source:` list.
+    #[serde(default)]
+    pub(crate) source: Option<SourceSpec>,
     /// Require that no guard dominates the sink.
     ///
     /// Off by default, because a rule that has not thought about guards
@@ -171,6 +241,68 @@ pub(crate) struct FlowDef {
     /// describe. Bounded at one hop -- see [`crate::flow::graph`].
     #[serde(default)]
     pub(crate) sink: Option<SinkKind>,
+    /// What to report when the value's origin cannot be traced at all.
+    ///
+    /// Absent, such a match is dropped. Present, it is reported as an
+    /// observation instead of the rule's declared kind, provided every
+    /// `requires` regex matches its capture. A value traced to a catalogued
+    /// source the rule does not list is still dropped: it is known not to
+    /// be what the rule is about.
+    #[serde(default)]
+    pub(crate) unproven: Option<UnprovenDef>,
+    /// Also treat a value that carries caller input as proven, even when no
+    /// listed `source:` produced it. Caller input is a function parameter
+    /// (other than `self`/`cls` or a command-line parameter), HTTP request
+    /// data, or the result of a catalogued model, tool or retrieval call; a
+    /// value computed by calls over such input, with the input as an
+    /// argument or receiver, carries it too (except through `ast.parse`).
+    /// A value that carries neither a listed source nor caller input still
+    /// takes the `unproven:` path. Requires `source:`.
+    #[serde(default)]
+    pub(crate) caller_input: bool,
+    /// Drop a match whose callee is a bare name this file binds itself (a
+    /// local `def eval`, an `import ... as eval`), so a rule about a Python
+    /// builtin only ever reports the builtin.
+    #[serde(default)]
+    pub(crate) builtin_callee: bool,
+    /// When true, a match whose captured value is a pure pass-through of a
+    /// non-entry-point function's own parameter, unreachable in this file
+    /// from any recognized entry point, is reported as `Kind::Observation`
+    /// instead of the rule's declared kind -- `title` and `remediation`
+    /// unchanged, only `kind`. See
+    /// `crate::flow::graph::FlowGraph::is_passthrough_observation_eligible`.
+    #[serde(default)]
+    pub(crate) passthrough_downgrade: bool,
+    /// When true, a match whose captured value carries caller input only
+    /// through function parameters, inside a function that is neither a
+    /// recognized entry point nor called from one in this file, is reported
+    /// as `Kind::Observation` instead of the rule's declared kind. See
+    /// `crate::flow::graph::FlowGraph::is_unreached_parameter_input`.
+    #[serde(default)]
+    pub(crate) unreached_parameter_downgrade: bool,
+}
+
+/// A `flow.unproven:` clause, exactly as written in YAML.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnprovenDef {
+    /// The kind an unproven match is reported as. Only `observation`.
+    pub(crate) kind: UnprovenKind,
+    /// Captured metavariable name to a regex its text must match, applied
+    /// only on this path.
+    #[serde(default)]
+    pub(crate) requires: HashMap<String, String>,
+}
+
+/// The kinds an unproven match may be reported as.
+///
+/// One variant on purpose: a match whose origin is unknown is not evidence
+/// of a defect, so `kind: defect` here fails to load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum UnprovenKind {
+    /// Reported as [`Kind::Observation`].
+    Observation,
 }
 
 /// One source kind or several, so a rule author writes `source: model_output`
@@ -197,4 +329,74 @@ impl SourceSpec {
 /// The metavariable a `flow:` clause tests when it does not name one.
 fn default_flow_variable() -> String {
     "ARG".to_owned()
+}
+
+/// A rule's `exclude_if:` clause, exactly as written in YAML.
+///
+/// ```yaml
+/// exclude_if:
+///   variable: ARG          # which capture to test; defaults to ARG
+///   kind: constant_path    # closed_value | constant_path | shell_quoted |
+///                          # stdin_dispatch | cli_argument | no_caller_input,
+///                          # one kind or a list of them
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExcludeIfDef {
+    /// The captured metavariable whose value is tested. Defaults to `ARG`,
+    /// the same default `flow:` uses and for the same reason.
+    #[serde(default = "default_flow_variable")]
+    pub(crate) variable: String,
+    /// Which Tier-2 structural predicate(s) to test.
+    pub(crate) kind: ExcludeIfKindSpec,
+}
+
+/// One `exclude_if:` kind or several, so a rule author writes `kind:
+/// closed_value` when one predicate is enough and `kind: [closed_value,
+/// shell_quoted]` when the match should be dropped if *any* of them proves
+/// the value safe.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ExcludeIfKindSpec {
+    One(ExcludeIfKind),
+    Many(Vec<ExcludeIfKind>),
+}
+
+impl ExcludeIfKindSpec {
+    pub(crate) fn kinds(&self) -> Vec<ExcludeIfKind> {
+        match self {
+            Self::One(kind) => vec![*kind],
+            Self::Many(kinds) => kinds.clone(),
+        }
+    }
+}
+
+/// Which Python-only structural predicate `exclude_if:` tests. See
+/// `crate::flow::graph::Resolved` for what each one means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExcludeIfKind {
+    /// The value's origin is closed: drawn from a set this file itself
+    /// fixes (a literal, a dict of literals with a proven membership check,
+    /// ...).
+    ClosedValue,
+    /// A path expression built only from literals, `__file__`, and calls to
+    /// a whitelisted set of pure path-construction functions.
+    ConstantPath,
+    /// Every non-literal segment is wrapped directly in
+    /// `shlex.quote(...)`/`shlex.join(...)`.
+    ShellQuoted,
+    /// Every non-literal segment traces to a direct, unprocessed read of
+    /// `sys.stdin` (`sys.stdin.read()`, `json.load(sys.stdin)`, `input()`).
+    StdinDispatch,
+    /// Every non-literal segment traces to the operator's own command line:
+    /// `sys.argv[...]`, an attribute of `<ArgumentParser>.parse_args()`/
+    /// `.parse_known_args()`, or a `click`/`typer` command function's own
+    /// parameter.
+    CliArgument,
+    /// The value has no non-literal segment that a caller or remote party
+    /// can supply: no function parameter (other than `self`/`cls` or a
+    /// click/typer command parameter), no HTTP request data, and no result
+    /// of a catalogued model, tool or retrieval call.
+    NoCallerInput,
 }

@@ -20,6 +20,11 @@
 //! collected the report says how many are being withheld and which flag shows
 //! them; it never says "no observations" while the summary counts three.
 //!
+//! A "Files read" section precedes the coverage gaps and says how many skill
+//! files, skill reference files, MCP configs and instruction files the scan
+//! read, so a clean result is never mistaken for a scan that ignored them;
+//! `--show-coverage` adds the path of every one.
+//!
 //! Coverage gaps are always printed, even when nothing was skipped and even
 //! when no CVE lookup ran: a reader must never read "no CVEs listed" as "no
 //! CVEs exist". The compliance crosswalk and the summary close it out.
@@ -30,7 +35,7 @@ use std::fmt::Write as _;
 use crate::category::Layer;
 use crate::compliance::{CROSSWALK_INTRO, Crosswalk, TERMINAL_CAVEAT};
 use crate::finding::{Confidence, Finding, Kind, Severity};
-use crate::report::{CveStatus, Report, Skip, SkipReason};
+use crate::report::{CveStatus, RemoteServer, RemoteStatus, Report, Skip, SkipReason};
 
 use super::{CrosswalkDetail, Glyphs, ScanResult, StdoutOptions, TerminalReport};
 
@@ -81,6 +86,7 @@ pub(crate) fn render(report: &Report, options: StdoutOptions) -> TerminalReport 
     render_verdict(&mut out, report, &defects, &observations, options);
     render_defects(&mut out, &defects, options);
     render_observations(&mut out, &observations, options);
+    render_files_read(&mut out, report, options);
     render_coverage(&mut out, report, options);
     render_crosswalks(&mut out, report, options);
 
@@ -172,6 +178,19 @@ fn render_steps(out: &mut String, report: &Report, options: StdoutOptions) {
             &format!(
                 "OSV vulnerability lookup — {} checked",
                 plural(*dependencies, "dependency", "dependencies")
+            ),
+            options,
+        ),
+        CveStatus::Partial {
+            dependencies,
+            incomplete,
+        } => step(
+            out,
+            false,
+            &format!(
+                "OSV vulnerability lookup incomplete — {} checked, results may be missing for {}",
+                plural(*dependencies, "dependency", "dependencies"),
+                plural(*incomplete, "dependency", "dependencies")
             ),
             options,
         ),
@@ -373,9 +392,11 @@ impl Section {
 /// missing-defenses section to controls that are genuinely absent rather than
 /// ones already accounted for above.
 ///
-/// `categories` is never empty — rule loading rejects a rule without one — but
-/// if that ever changed, an unfiled finding must still be printed rather than
-/// silently dropped, so it falls through to cross-layer.
+/// `categories` is usually non-empty — YAML rule loading rejects a rule
+/// without one — but a hand-written Rust check can leave it empty (for
+/// example `BAS-SKILL-001`, a spec-validity observation that carries no
+/// security category). Such an unfiled finding must still be printed rather
+/// than silently dropped, so it falls through to cross-layer.
 fn section_of(finding: &Finding) -> Section {
     finding
         .categories
@@ -491,23 +512,31 @@ fn write_finding_head(out: &mut String, finding: &Finding, code: &str, options: 
     write_wrapped(out, &location, &indent, None, options);
 }
 
-/// `"Confidence: high · Categories: LLM01, ZT4"`.
+/// `"Confidence: high · Categories: LLM01, ZT4"`, or just `"Confidence: high"`
+/// for a hand-written Rust check that carries no category at all (for
+/// example `BAS-SKILL-001`, a spec-validity observation) -- an empty list
+/// still deserves a line, just not a dangling `· Categories:` with nothing
+/// after it.
 fn write_attribution(out: &mut String, finding: &Finding, options: StdoutOptions) {
     let categories: Vec<&str> = finding
         .categories
         .iter()
         .map(|category| category.id())
         .collect();
-    let label = if categories.len() == 1 {
-        "Category"
+    let confidence = format!("Confidence: {}", confidence_label(finding.confidence));
+    let line = if categories.is_empty() {
+        options.glyphs.text(&confidence)
     } else {
-        "Categories"
+        let label = if categories.len() == 1 {
+            "Category"
+        } else {
+            "Categories"
+        };
+        options.glyphs.text(&format!(
+            "{confidence} \u{b7} {label}: {}",
+            categories.join(", ")
+        ))
     };
-    let line = options.glyphs.text(&format!(
-        "Confidence: {} \u{b7} {label}: {}",
-        confidence_label(finding.confidence),
-        categories.join(", ")
-    ));
     write_wrapped(out, &line, "", Some(ansi::DIM), options);
 }
 
@@ -571,6 +600,57 @@ fn render_observations(out: &mut String, observations: &[&Finding], options: Std
 }
 
 // ---------------------------------------------------------------------------
+// Files read
+// ---------------------------------------------------------------------------
+
+/// How many files of each kind the scan read, and with `show_coverage` which.
+///
+/// Always printed, so a clean result on a skills repository is distinguishable
+/// from a scan that never looked at skills. The listing is uncapped and each
+/// path is printed whole, however long: a path cut short names no file.
+fn render_files_read(out: &mut String, report: &Report, options: StdoutOptions) {
+    let coverage = &report.coverage;
+    heading(out, "Files read", options);
+
+    let sentence = format!(
+        "{}, {}, {}, {} read.",
+        plural(coverage.skill_files.len(), "skill file", "skill files"),
+        plural(
+            coverage.skill_reference_files.len(),
+            "skill reference",
+            "skill references"
+        ),
+        plural(coverage.mcp_manifests.len(), "MCP config", "MCP configs"),
+        plural(
+            coverage.instruction_files.len(),
+            "instruction file",
+            "instruction files"
+        ),
+    );
+    write_wrapped(out, &sentence, "", None, options);
+
+    if options.show_coverage {
+        let kinds: [(&str, &[String]); 5] = [
+            ("Skill files", &coverage.skill_files),
+            ("Skill reference files", &coverage.skill_reference_files),
+            ("MCP configs", &coverage.mcp_manifests),
+            ("Instruction files", &coverage.instruction_files),
+            ("Skill files no analyser reads", &coverage.skill_unanalysed),
+        ];
+        for (label, paths) in kinds {
+            if paths.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "\n{label}:");
+            for path in paths {
+                let _ = writeln!(out, "{PROSE}{path}");
+            }
+        }
+    }
+    out.push('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Coverage gaps
 // ---------------------------------------------------------------------------
 
@@ -602,8 +682,67 @@ fn render_coverage(out: &mut String, report: &Report, options: StdoutOptions) {
         out.push('\n');
     }
 
+    write_remote_servers(out, &report.coverage.remote_servers, options);
+
     write_wrapped(out, &cve_sentence(&report.cve), "", None, options);
     out.push_str("\n\n");
+}
+
+/// Which remote servers `--inspect-remote` reached and which it did not.
+///
+/// Inspected servers are only counted; their findings are in the report. The
+/// rest are listed under one sentence per status, in the order of
+/// [`RemoteStatus`]. Prints nothing when the scan did not look at remote
+/// servers.
+fn write_remote_servers(out: &mut String, servers: &[RemoteServer], options: StdoutOptions) {
+    if servers.is_empty() {
+        return;
+    }
+    let inspected = servers
+        .iter()
+        .filter(|server| server.status == RemoteStatus::Inspected)
+        .count();
+    let not_inspected = servers.len() - inspected;
+    let counts = if not_inspected == 0 {
+        format!("Remote MCP servers: {inspected} inspected.")
+    } else {
+        format!("Remote MCP servers: {inspected} inspected, {not_inspected} not inspected.")
+    };
+    write_wrapped(out, &counts, "", None, options);
+
+    let mut by_status: BTreeMap<RemoteStatus, Vec<&RemoteServer>> = BTreeMap::new();
+    for server in servers {
+        by_status.entry(server.status).or_default().push(server);
+    }
+    for (status, entries) in by_status {
+        let Some(sentence) = remote_status_sentence(status) else {
+            continue;
+        };
+        write_wrapped(out, sentence, "", None, options);
+        for entry in entries {
+            let _ = writeln!(out, "{PROSE}{}: {}", entry.file, entry.server);
+        }
+    }
+    out.push('\n');
+}
+
+/// Why a remote server was not inspected. `None` for the inspected status,
+/// which is counted and not listed.
+fn remote_status_sentence(status: RemoteStatus) -> Option<&'static str> {
+    match status {
+        RemoteStatus::Inspected => None,
+        RemoteStatus::NotPublic => {
+            Some("not contacted because the address is not a public https address:")
+        }
+        RemoteStatus::NeedsCredentials => Some(
+            "not inspected because the entry carries credentials, headers or a placeholder, or the server asked for credentials:",
+        ),
+        RemoteStatus::Unsupported => {
+            Some("not inspected because the entry is a command or uses the older SSE transport:")
+        }
+        RemoteStatus::Unreachable => Some("contacted but did not return a usable tool list:"),
+        RemoteStatus::Offline => Some("not contacted because `--offline` was given:"),
+    }
 }
 
 /// Two columns: what was skipped, and the one thing that differs between
@@ -651,6 +790,14 @@ fn cve_sentence(status: &CveStatus) -> String {
         CveStatus::Checked { dependencies } => format!(
             "{} checked against the OSV vulnerability database.",
             plural(*dependencies, "dependency was", "dependencies were")
+        ),
+        CveStatus::Partial {
+            dependencies,
+            incomplete,
+        } => format!(
+            "{} checked against the OSV vulnerability database, but results for {} may be incomplete because not every OSV response could be read.",
+            plural(*dependencies, "dependency was", "dependencies were"),
+            plural(*incomplete, "dependency", "dependencies")
         ),
         CveStatus::NoManifest => {
             "CVEs were not checked because no dependency manifest was found.".to_owned()
@@ -1268,7 +1415,11 @@ fn ellipsise(text: &str, width: usize, glyphs: Glyphs) -> String {
 ///
 /// Worth the eight lines: a security tool that prints "1 files" invites the
 /// reader to wonder what else it did not check.
-fn plural(count: usize, one: &str, many: &str) -> String {
+///
+/// `pub(super)` rather than private: `render::sarif`'s own CVE-incomplete
+/// notification counts dependencies the same way and reuses this rather than
+/// growing a second copy.
+pub(super) fn plural(count: usize, one: &str, many: &str) -> String {
     if count == 1 {
         format!("{count} {one}")
     } else {
@@ -1311,6 +1462,7 @@ mod tests {
             dependencies: 14,
             result: ScanResult::Failed,
             exit_code: 1,
+            show_coverage: false,
         }
     }
 
@@ -1733,6 +1885,38 @@ mod tests {
         );
     }
 
+    /// A hand-written Rust check (e.g. `BAS-SKILL-001`) can leave `categories`
+    /// empty rather than claiming a security category it does not have. The
+    /// attribution line must not print a dangling `· Categories:` with
+    /// nothing after it, and the finding must still be printed -- filed under
+    /// cross-layer, the same fallback an unfiled finding of any kind gets.
+    #[test]
+    fn empty_categories_omits_the_label_and_falls_through_to_cross_layer() {
+        let mut report = empty_report();
+        let mut uncategorised = defect();
+        uncategorised.rule_id = "BAS-SKILL-001".to_string();
+        uncategorised.title = "SKILL.md frontmatter is not spec-valid".to_string();
+        uncategorised.categories = Vec::new();
+        report.findings.push(uncategorised);
+        report.summary.defects = 1;
+
+        let text = summarised(&report, false);
+
+        assert!(
+            !text.contains("Categories:") && !text.contains("Category:"),
+            "an empty category list must not print a dangling label:\n{text}"
+        );
+        assert!(
+            text.contains("Confidence: high"),
+            "confidence must still be printed on its own:\n{text}"
+        );
+        assert!(
+            text.contains("CROSS-LAYER"),
+            "an uncategorised finding belongs under cross-layer:\n{text}"
+        );
+        assert!(text.contains("BAS-SKILL-001"), "got:\n{text}");
+    }
+
     #[test]
     fn every_defect_is_printed_exactly_once() {
         let report = layered_report();
@@ -1869,6 +2053,18 @@ mod tests {
             unreachable.contains("CVEs were not checked: no network connection."),
             "Unreachable must be visible, got: {unreachable}"
         );
+
+        let partial = summarised(
+            &report_with(CveStatus::Partial {
+                dependencies: 9,
+                incomplete: 2,
+            }),
+            false,
+        );
+        assert!(
+            partial.contains("may be incomplete"),
+            "Partial must be visible, got: {partial}"
+        );
     }
 
     /// A scan that skipped nothing still gets the section, because the CVE
@@ -1882,6 +2078,220 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("CVEs were not checked"), "{text}");
+    }
+
+    fn remote(
+        file: &str,
+        server: &str,
+        status: crate::report::RemoteStatus,
+    ) -> crate::report::RemoteServer {
+        crate::report::RemoteServer {
+            file: file.to_owned(),
+            server: server.to_owned(),
+            status,
+            tools: None,
+        }
+    }
+
+    /// Every status that was not inspected gets one sentence and its entries,
+    /// after the skipped-file groups and before the CVE sentence. Inspected
+    /// servers are counted and not listed.
+    #[test]
+    fn remote_servers_are_grouped_by_status_before_the_cve_sentence() {
+        use crate::report::RemoteStatus::{
+            Inspected, NeedsCredentials, NotPublic, Offline, Unreachable, Unsupported,
+        };
+        let mut report = report_with(CveStatus::NoManifest);
+        report.skipped = every_skip_reason();
+        report.coverage.remote_servers = vec![
+            remote("a.json", "listed-ok", Inspected),
+            remote("a.json", "local", NotPublic),
+            remote("b.json", "keyed", NeedsCredentials),
+            remote("b.json", "cmd", Unsupported),
+            remote("c.json", "down", Unreachable),
+            remote("c.json", "held", Offline),
+        ];
+
+        let text = summarised(&report, false);
+        let start = position(&text, "Coverage gaps");
+        let section = unwrapped(&text[start..position(&text, "Scan complete:")]);
+
+        assert!(
+            section.contains("Remote MCP servers: 1 inspected, 5 not inspected."),
+            "{section}"
+        );
+        for sentence in [
+            "not contacted because the address is not a public https address:",
+            "not inspected because the entry carries credentials, headers or a placeholder, or the server asked for credentials:",
+            "not inspected because the entry is a command or uses the older SSE transport:",
+            "contacted but did not return a usable tool list:",
+            "not contacted because `--offline` was given:",
+        ] {
+            assert!(section.contains(sentence), "{sentence}\n{section}");
+        }
+        for entry in [
+            "a.json: local",
+            "b.json: keyed",
+            "b.json: cmd",
+            "c.json: down",
+            "c.json: held",
+        ] {
+            assert!(section.contains(entry), "{entry}\n{section}");
+        }
+        assert!(!section.contains("listed-ok"), "{section}");
+
+        let order = [
+            "Remote MCP servers:",
+            "a public https address:",
+            "asked for credentials:",
+            "older SSE transport:",
+            "usable tool list:",
+            "`--offline` was given:",
+            "CVEs were not checked",
+        ];
+        let at: Vec<usize> = order.iter().map(|n| position(&section, n)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{section}");
+        let last_skip = report.skipped.iter().map(|s| position(&section, &s.path));
+        assert!(
+            last_skip.max().unwrap_or(0) < at[0],
+            "remote lines must follow the skipped groups:\n{section}"
+        );
+        // Not-inspected servers are never counted as skipped files.
+        assert_eq!(text.matches("Remote MCP servers:").count(), 1, "{text}");
+    }
+
+    /// With nothing left uninspected there are no status sentences.
+    #[test]
+    fn only_inspected_servers_print_just_the_count() {
+        let mut report = report_with(CveStatus::NoManifest);
+        report.coverage.remote_servers = vec![
+            remote("a.json", "one", crate::report::RemoteStatus::Inspected),
+            remote("a.json", "two", crate::report::RemoteStatus::Inspected),
+        ];
+        let text = summarised(&report, false);
+        assert!(
+            text.contains("Remote MCP servers: 2 inspected.\n"),
+            "{text}"
+        );
+        assert!(!text.contains("not inspected"), "{text}");
+        assert!(!text.contains("not contacted"), "{text}");
+        assert!(!text.contains("a.json: one"), "{text}");
+    }
+
+    /// A scan that did not inspect remote servers prints nothing about them.
+    #[test]
+    fn a_default_report_has_no_remote_server_lines() {
+        let text = summarised(&report_with(CveStatus::NoManifest), false);
+        assert!(!text.contains("Remote MCP servers"), "{text}");
+    }
+
+    // -----------------------------------------------------------------
+    // Files read
+    // -----------------------------------------------------------------
+
+    /// A report that read two skill files and one MCP config.
+    fn report_that_read_files() -> Report {
+        let mut report = empty_report();
+        report.coverage.skill_files = vec![
+            "skills/a/SKILL.md".to_string(),
+            "skills/b/SKILL.md".to_string(),
+        ];
+        report.coverage.mcp_manifests = vec![".mcp.json".to_string()];
+        report
+    }
+
+    fn listing(report: &Report, color: bool, glyphs: Glyphs) -> String {
+        render(
+            report,
+            StdoutOptions {
+                show_coverage: true,
+                glyphs,
+                ..options(color)
+            },
+        )
+        .text
+    }
+
+    #[test]
+    fn the_default_report_counts_files_read_and_lists_none() {
+        let text = summarised(&report_that_read_files(), false);
+        assert!(text.contains("Files read\n"), "{text}");
+        assert!(
+            unwrapped(&text).contains(
+                "2 skill files, 0 skill references, 1 MCP config, 0 instruction files read."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("skills/a/SKILL.md"), "{text}");
+        assert!(!text.contains(".mcp.json"), "{text}");
+    }
+
+    #[test]
+    fn show_coverage_lists_every_path_in_order_under_its_label() {
+        let mut report = report_that_read_files();
+        report.coverage.skill_unanalysed = vec!["skills/a/run.sh".to_string()];
+        let text = listing(&report, false, Glyphs::Unicode);
+
+        let skills = position(
+            &text,
+            "Skill files:\n  skills/a/SKILL.md\n  skills/b/SKILL.md\n",
+        );
+        let mcp = position(&text, "MCP configs:\n  .mcp.json\n");
+        let unread = position(&text, "Skill files no analyser reads:\n  skills/a/run.sh\n");
+        assert!(skills < mcp && mcp < unread, "{text}");
+        assert!(!text.contains("Skill reference files:"), "{text}");
+        assert!(!text.contains("Instruction files:"), "{text}");
+    }
+
+    #[test]
+    fn a_single_file_of_a_kind_is_counted_in_the_singular() {
+        let mut report = empty_report();
+        report.coverage.skill_files = vec!["SKILL.md".to_string()];
+        report.coverage.skill_reference_files = vec!["references/a.md".to_string()];
+        report.coverage.mcp_manifests = vec![".mcp.json".to_string()];
+        report.coverage.instruction_files = vec!["AGENTS.md".to_string()];
+        let text = unwrapped(&summarised(&report, false));
+        assert!(
+            text.contains(
+                "1 skill file, 1 skill reference, 1 MCP config, 1 instruction file read."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn files_read_comes_before_the_coverage_gaps() {
+        let text = summarised(&report_that_read_files(), false);
+        assert!(position(&text, "Files read") < position(&text, "Coverage gaps"));
+    }
+
+    #[test]
+    fn the_files_read_section_leaves_no_escape_or_unicode_behind() {
+        let report = report_that_read_files();
+        let plain = listing(&report, false, Glyphs::Unicode);
+        assert!(!plain.contains('\u{1b}'), "{plain}");
+        let ascii = listing(&report, false, Glyphs::Ascii);
+        assert!(ascii.is_ascii(), "{ascii}");
+    }
+
+    #[test]
+    fn the_files_read_count_line_stays_inside_the_wrap_width() {
+        let mut report = empty_report();
+        let many = |n: usize| vec!["f".to_string(); n];
+        report.coverage.skill_files = many(123_456);
+        report.coverage.skill_reference_files = many(234_567);
+        report.coverage.mcp_manifests = many(345_678);
+        report.coverage.instruction_files = many(456_789);
+        let text = summarised(&report, false);
+        let start = position(&text, "Files read");
+        let end = position(&text, "Coverage gaps");
+        for line in text[start..end].lines() {
+            assert!(line.chars().count() <= 78, "{line:?}");
+        }
+        assert!(
+            unwrapped(&text).contains("123456 skill files, 234567 skill references"),
+            "{text}"
+        );
     }
 
     // -----------------------------------------------------------------

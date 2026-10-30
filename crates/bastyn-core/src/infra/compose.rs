@@ -12,22 +12,27 @@ use crate::mcp::checks::locate;
 
 /// The one host path that is a container escape wherever it is mounted:
 /// writing to it drives the Docker daemon, which runs as root on the host.
-const DOCKER_SOCKET: &str = "/var/run/docker.sock";
+pub(crate) const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
 /// Run every Compose check against every service, in service-name order so
 /// two runs over one file always produce findings in the same order.
 ///
-/// A file that does not parse, or that parses but has no `services` map,
-/// yields nothing. `docker-compose.yml` is not a name that promises a schema
-/// the way `mcp.json` is — templating engines and CI generators legitimately
-/// produce files under it that no YAML parser accepts — so a parse failure is
-/// silence here rather than the `BAS-MCP-000` treatment.
-pub(super) fn run_all(relative_path: &Path, contents: &str) -> Vec<Finding> {
-    let Ok(document) = serde_yaml_ng::from_str::<Value>(contents) else {
-        return Vec::new();
-    };
+/// A file that parses but has no `services` map yields `Ok(Vec::new())`
+/// rather than an error: templated or generated files often carry that
+/// shape and still deserve to be read silently, the same way a `services:`
+/// map with nothing worth flagging in it does. Invalid YAML is different —
+/// no check here can even look at the file — so it comes back as
+/// [`super::InfraError::UnparseableCompose`], the same treatment an
+/// unparseable MCP config or manifest gets, so the caller can list the file
+/// as skipped rather than count it as covered.
+pub(super) fn run_all(
+    relative_path: &Path,
+    contents: &str,
+) -> Result<Vec<Finding>, super::InfraError> {
+    let document = serde_yaml_ng::from_str::<Value>(contents)
+        .map_err(|_| super::InfraError::UnparseableCompose)?;
     let Some(services) = document.get("services").and_then(Value::as_mapping) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut named: Vec<(&str, &Value)> = services
@@ -49,7 +54,7 @@ pub(super) fn run_all(relative_path: &Path, contents: &str) -> Vec<Finding> {
             contents,
         ));
     }
-    findings
+    Ok(findings)
 }
 
 /// `BAS-INFRA-003` — a service that mounts the Docker socket.
@@ -268,7 +273,8 @@ fn check_environment_credentials(
             Finding {
                 rule_id: "BAS-INFRA-006".to_owned(),
                 title: "Hardcoded credential in deployment configuration".to_owned(),
-                kind: Kind::Defect,
+                // Reported as an observation: the match alone does not show a real problem.
+                kind: Kind::Observation,
                 severity: credential::credential_severity(&key, &value),
                 confidence: Confidence::High,
                 categories: vec![Category::Zt1],
@@ -344,43 +350,55 @@ fn location(relative_path: &Path, line: usize) -> Location {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "a failed assumption in a test should fail the test"
+)]
 mod tests {
     use super::*;
 
     fn rules(contents: &str) -> Vec<String> {
         run_all(Path::new("docker-compose.yml"), contents)
+            .unwrap()
             .into_iter()
             .map(|finding| finding.rule_id)
             .collect()
     }
 
     #[test]
-    fn malformed_yaml_yields_nothing_and_does_not_panic() {
+    fn malformed_yaml_is_reported_as_unparseable_and_does_not_panic() {
         // Every repository has a broken YAML file somewhere. A compose file
-        // we cannot read is a file we say nothing about — the MCP analyser
-        // reports its own malformed configs because the name promises a
-        // schema; `docker-compose.yml` here does not.
+        // we cannot read cannot be checked for the container boundary it
+        // claims to describe, so it comes back as an error — the same
+        // treatment an unparseable MCP config or manifest gets.
         for broken in [
             "services:\n  web:\n    privileged: true\n   bad indent: yes\n",
             "\tservices:\n",
             "services: [unclosed\n",
             "%YAML 9.9\n---\nservices: {}\n",
         ] {
-            assert!(rules(broken).is_empty(), "{broken:?} produced findings");
+            assert_eq!(
+                run_all(Path::new("docker-compose.yml"), broken),
+                Err(crate::infra::InfraError::UnparseableCompose),
+                "{broken:?} did not report as unparseable"
+            );
         }
     }
 
     #[test]
     fn a_yaml_file_without_services_is_not_a_compose_file() {
-        assert!(rules("name: something-else\nfoo: bar\n").is_empty());
-        assert!(rules("").is_empty());
+        assert_eq!(
+            rules("name: something-else\nfoo: bar\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(rules(""), Vec::<String>::new());
     }
 
     #[test]
     fn a_docker_socket_mount_is_a_defect() {
         let contents = "services:\n  agent:\n    image: app\n    volumes:\n      - ./data:/data\n      - /var/run/docker.sock:/var/run/docker.sock\n";
 
-        let findings = run_all(Path::new("docker-compose.yml"), contents);
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
 
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, "BAS-INFRA-003");
@@ -411,7 +429,7 @@ mod tests {
     fn privileged_true_is_a_defect() {
         let contents = "services:\n  agent:\n    image: app\n    privileged: true\n";
 
-        let findings = run_all(Path::new("docker-compose.yml"), contents);
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
 
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, "BAS-INFRA-004");
@@ -421,8 +439,14 @@ mod tests {
 
     #[test]
     fn privileged_false_or_absent_is_not_a_finding() {
-        assert!(rules("services:\n  agent:\n    privileged: false\n").is_empty());
-        assert!(rules("services:\n  agent:\n    image: app\n").is_empty());
+        assert_eq!(
+            rules("services:\n  agent:\n    privileged: false\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            rules("services:\n  agent:\n    image: app\n"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -432,7 +456,7 @@ mod tests {
         // cannot show that removing it was wrong.
         let contents = "services:\n  agent:\n    image: app\n    network_mode: host\n";
 
-        let findings = run_all(Path::new("docker-compose.yml"), contents);
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
 
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, "BAS-INFRA-005");
@@ -457,7 +481,7 @@ mod tests {
         // cannot show that removing it was wrong for this service.
         let contents = "services:\n  agent:\n    image: app\n    pid: host\n";
 
-        let findings = run_all(Path::new("docker-compose.yml"), contents);
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
 
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, "BAS-INFRA-010");
@@ -474,7 +498,10 @@ mod tests {
             assert!(rules(&contents).is_empty(), "{mode} was wrongly flagged");
         }
         // No `pid:` key at all is the overwhelmingly common case.
-        assert!(rules("services:\n  agent:\n    image: app\n").is_empty());
+        assert_eq!(
+            rules("services:\n  agent:\n    image: app\n"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -483,7 +510,7 @@ mod tests {
         // occurrence — deduplication would then silently drop one of them.
         let contents = "services:\n  one:\n    privileged: true\n  two:\n    privileged: true\n";
 
-        let findings = run_all(Path::new("docker-compose.yml"), contents);
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
 
         let mut lines: Vec<usize> = findings.iter().map(|f| f.location.line).collect();
         lines.sort_unstable();
@@ -495,7 +522,7 @@ mod tests {
         let contents =
             "services:\n  zebra:\n    privileged: true\n  alpha:\n    privileged: true\n";
 
-        let findings = run_all(Path::new("docker-compose.yml"), contents);
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
 
         assert_eq!(findings.len(), 2);
         assert!(findings[0].description.contains("alpha"), "{findings:#?}");
@@ -510,17 +537,17 @@ mod tests {
     }
 
     #[test]
-    fn a_hardcoded_weak_password_in_the_list_form_is_a_defect() {
+    fn a_hardcoded_weak_password_in_the_list_form_is_an_observation() {
         // Verbatim shape from the head-to-head benchmark against a Python
         // prototype: a real docker-compose file shipping default MySQL
         // credentials.
         let contents = "services:\n  db:\n    image: mysql:8\n    environment:\n      - MYSQL_ROOT_PASSWORD=aa123456\n";
 
-        let findings = run_all(Path::new("docker-compose.yml"), contents);
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
 
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, "BAS-INFRA-006");
-        assert_eq!(findings[0].kind, Kind::Defect);
+        assert_eq!(findings[0].kind, Kind::Observation);
         assert_eq!(findings[0].categories, vec![Category::Zt1]);
         assert_eq!(findings[0].location.line, 5);
     }
@@ -563,6 +590,25 @@ mod tests {
             "services:\n  db:\n    environment:\n      MYSQL_ALLOW_EMPTY_PASSWORD: \"yes\"\n";
 
         assert!(rules(contents).is_empty(), "{:#?}", rules(contents));
+    }
+
+    #[test]
+    fn a_storage_mode_setting_on_a_secret_named_key_is_not_flagged_but_a_real_value_nearby_is() {
+        // Verbatim shape from the community benchmark: a key containing
+        // SECRETKEY whose value is a mode word, two lines above the real
+        // hardcoded secret on a differently-named key.
+        let contents = "services:\n  agent:\n    environment:\n      SECRETKEY_STORAGE_TYPE: local\n      SECRETKEY_PATH: /root/.agent\n      AGENT_SECRETKEY_OVERWRITE: \"agent-demo-2026\"\n";
+
+        let findings = run_all(Path::new("docker-compose.yml"), contents).unwrap();
+
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].rule_id, "BAS-INFRA-006");
+        assert!(
+            findings[0]
+                .description
+                .contains("AGENT_SECRETKEY_OVERWRITE"),
+            "{findings:#?}"
+        );
     }
 
     #[test]

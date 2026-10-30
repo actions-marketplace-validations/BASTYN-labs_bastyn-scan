@@ -2,7 +2,7 @@
 
 **Nothing in this file is a shipped rule.** It is a design catalogue of
 candidate rules, and every count in it (100 rules, the per-category table, the
-30-rule shortlist) describes what is proposed, not what exists. Bastyn ships 43
+30-rule shortlist) describes what is proposed, not what exists. Bastyn ships 55
 rules; they live in `crates/bastyn-core/rules/*.yml`, and
 [`docs/frameworks/README.md`](frameworks/README.md) records which framework
 categories currently have a detector behind them.
@@ -48,18 +48,41 @@ risk** (low/medium/high, with the false-positive shape), **Prevalence**
 
 **Detectability is graded conservatively on purpose.** Bastyn's own measured
 failure mode is rules that gate on a variable being *named* `response` or
-`prompt`. The current shipped rules (e.g. `BAS-LLM10-001`, `crates/bastyn-core/rules/bastyn.yml`)
-do exactly this via `metavariable_matches: ARG: "(?i)(response|reply|completion|...)"`,
-which is why 0 of 119 realistic alternate variable names were caught in
-testing. Any catalogue entry below that can only work by matching a name
-rather than tracing where a value actually came from is marked `dataflow`,
-not `structural`, even where an argument could be read as "this is basically
-the same shape we already ship."
+`prompt`. `crates/bastyn-core/tests/brittleness_gate.rs` puts a number on
+it: across every row the file measures, only 32.8% of realistic alternate
+variable names are still caught (39 of 119). That figure includes four rows
+that have since moved off name gating entirely and score 100% (see below),
+which pulls the overall number up; set those four rows aside and the ten
+rows that still decide purely by name catch 2.4% (2 of 82). Those ten gates
+(e.g. `BAS-LLM10-006`, via
+`metavariable_matches: ARG: "(?i)(response|reply|completion|...)"` in
+`crates/bastyn-core/rules/bastyn.yml`) still decide purely by name and
+mostly score 0%. `BAS-LLM10-001` to `-004` and `BAS-ZT4-001`/`-002` have
+since moved off name gating and onto the dataflow graph in
+`crates/bastyn-core/src/flow/` instead. `BAS-LLM10-001` to `-003` and
+`BAS-ZT4-001`/`-002` ask where a value actually came from; `BAS-LLM10-004`
+(since 2026-09-25) still uses the same graph for its closed-value and guard
+checks, but no longer asks where the value came from at all -- it reports
+unconditionally on any non-literal, non-closed, non-guarded argument, the
+same composition-is-the-defect philosophy `BAS-LLM10-009`/`-017`/`-018` use.
+Of those, only the four rows the brittleness gate actually measures —
+`BAS-LLM10-001`'s, `-002`'s and `-003`'s `ARG` gates, and `BAS-ZT4-001`'s
+`VAR` gate — are confirmed at 100%; `BAS-LLM10-004` (which never had a
+naming gate to test in the first place) and `BAS-ZT4-002` are not in that
+measurement. That graph is Python-only, single-file, and has no
+TypeScript/JavaScript equivalent yet.
+Any catalogue entry below that can only work by matching a name rather than
+tracing where a value actually came from is marked `dataflow`, not
+`structural`, even where an argument could be read as "this is basically the
+same shape we already ship."
 
 ## LLM01 Prompt Injection
 
 Bastyn ships `BAS-ZT4-001` here today (raw user input folded into an f-string
-system prompt via name-matching). The entries below extend the category to
+system prompt, decided from the flow graph: a value traced to request data,
+tool output, retrieved context, or a file/network read is a defect, and an
+untraceable value is at most a low-confidence observation when its name
+still reads as user input). The entries below extend the category to
 untrusted content that isn't necessarily "user input" in the request-body
 sense: retrieved documents, tool output, and the manifests/config that
 describe an agent's own tools.
@@ -191,6 +214,8 @@ Cursor/Copilot.
 **Source:** [Semgrep `ai-config-hidden-unicode`](https://github.com/semgrep/semgrep-rules/blob/develop/ai/ai-best-practices/ai-config-hidden-unicode/ai-config-hidden-unicode.yaml); [Snyk agent-scan W021](https://github.com/snyk/agent-scan/blob/main/docs/issue-codes.md)
 
 ### LLM01.7 Prompt injection embedded in an MCP tool's own description
+*Now shipped as `BAS-LLM01-002`.*
+
 **What it detects:** A tool's `description` field contains adversarial
 imperative text meant to hijack the calling agent, invisible to the human
 approving the tool but fully visible to the model.
@@ -209,6 +234,8 @@ servers have been found in the wild by both Snyk and Invariant Labs.
 **Source:** [Snyk agent-scan, issue E001](https://github.com/snyk/agent-scan/blob/main/docs/issue-codes.md)
 
 ### LLM01.8 Suspicious/dangerous keyword pattern in a tool description
+*Now shipped as `BAS-LLM01-003`.*
+
 **What it detects:** Lower-confidence lexical signal: phrases like "ignore
 previous instructions," "override," "bypass," or "do not tell the user"
 inside a tool description.
@@ -223,6 +250,10 @@ deleting") share vocabulary with the attack pattern.
 **Source:** [Snyk agent-scan, issue W001](https://github.com/snyk/agent-scan/blob/main/docs/issue-codes.md)
 
 ### LLM01.9 SKILL.md/AGENT.md prompt-injection frontmatter
+*Sits next to the shipped `BAS-LLM01-002`/`BAS-LLM01-003`, which cover Python
+`@tool`/`@mcp.tool()` docstrings only; this SKILL.md/AGENT.md-manifest variant
+remains unshipped.*
+
 **What it detects:** A skill or agent manifest's `description:` field (or
 body) contains "ignore previous instructions," "disregard prior,"
 `<IMPORTANT>`, or "system: you are". Same class of attack as LLM01.7,
@@ -976,32 +1007,42 @@ not yet common outside advanced agent-memory systems.
 
 ## LLM10 Improper Output Handling
 
-Bastyn ships seven rules here today (`BAS-LLM10-001` through `-007`), and
+Bastyn ships eighteen rules here today (`BAS-LLM10-001` through `-018`), and
 it is the category the project's own docs correctly call the highest
-priority, because running model output as code is wrong in every deployment. It
-is also the category that most exposes the name-matching problem: every
-shipped `BAS-LLM10-*` rule gates on `metavariable_matches` against a
-variable-name regex (`response|reply|completion|message|content|choices|
-output|generated`), not on where the value actually came from. LLM10.1 and
-LLM10.2 below restate the two highest-value existing rules with the
-provenance-correct framing; the rest are new.
+priority, because running model output as code is wrong in every deployment.
+It is also the category that most exposed the name-matching problem:
+`BAS-LLM10-001` to `-004` have since moved onto the flow graph in
+`crates/bastyn-core/src/flow/` and ask it where a value actually came from,
+rather than what it is called. `-006` and `-007` still gate on
+`metavariable_matches` against a variable-name regex
+(`response|reply|completion|message|content|choices|output|generated`);
+`-005` has no such gate at all and reports `eval()`/`new Function()` on any
+non-literal argument. All three are observations rather than defects because
+they run over TypeScript/JavaScript, which has no dataflow graph yet.
+LLM10.1 and LLM10.2 below restate the two highest-value existing rules
+with the provenance-correct framing `-001` and `-002` have since shipped,
+broadened to reach the SDK-family calls and the JS/TS side the shipped
+rules' flow graph does not yet cover; the rest are new.
 
 ### LLM10.1 `eval`/`exec` on a value traced from an LLM SDK response object
 **What it detects:** The same defect as `BAS-LLM10-001`
-(`eval($ARG)`/`exec($ARG)`), but detected by tracing `$ARG` back through
-assignments to an `openai.*.create(...)`/`anthropic.*.create(...)`/
-`.generate_content(...)` call, rather than by matching the argument's
-variable name against a fixed word list.
+(`eval($ARG)`/`exec($ARG)`), which itself now asks Bastyn's Python flow
+graph whether `$ARG` traces back to a model call rather than matching its
+name. This entry broadens that to explicitly resolve `$ARG` through an
+`openai.*.create(...)`/`anthropic.*.create(...)`/`.generate_content(...)`
+call, and to the JavaScript and TypeScript ecosystem the shipped rule's flow
+graph does not reach yet.
 ```python
 code = client.messages.create(...).content[0].text
 exec(code)   # flagged regardless of what "code" is called
 ```
 **Languages:** Python, JavaScript, TypeScript
 **Kind:** defect
-**Detectability:** dataflow. This is the exact case the project's own
-measurement (0/119 alternate namings caught) calls out. A name-only rule
-is provably unreliable; this requires tracing the SDK response object
-through renames to the sink.
+**Detectability:** dataflow. `BAS-LLM10-001` migrated off the name-only gate
+for Python and now scores 100% survival on the project's own realistic-
+renaming measurement (`crates/bastyn-core/tests/brittleness_gate.rs`); this
+entry extends the same tracing requirement to TypeScript/JavaScript, which
+has no dataflow graph yet.
 **Precision risk:** medium. Legitimate sandboxed code-execution tools
 (e.g. an `mcp-run-python`-style interpreter) route through a real
 interpreter, not raw `eval`; the sink type itself must be distinguished.
@@ -1012,9 +1053,11 @@ real Replit exploit of this exact shape.
 
 ### LLM10.2 Shell-exec on a value traced from LLM output
 **What it detects:** The same defect as `BAS-LLM10-002`
-(`os.system`/`subprocess.run(..., shell=True)`), detected via provenance
-tracing from an LLM response object through string-building operations to
-the shell sink, rather than by variable name.
+(`os.system`/`subprocess.run(..., shell=True)`), which itself now traces an
+LLM response object through string-building operations to the shell sink via
+Bastyn's Python flow graph rather than matching a variable name. This entry
+extends the same tracing to the JavaScript and TypeScript ecosystem the
+shipped rule's flow graph does not reach yet.
 ```python
 cmd = f"ping -c 1 {tool_call_result}"
 subprocess.run(cmd, shell=True)
@@ -1144,6 +1187,8 @@ parsing-confusion attack bypassed.
 **Source:** [AutoGPT CVE-2025-0454 write-up](https://medium.com/@narendarlb123/1-cve-2025-0454-autogpt-ssrf-via-url-parsing-confusion-921d66fafcbe) (independent write-up, cross-checked against the GitHub Advisories search index; treat as secondary evidence pending a primary GHSA record)
 
 ### LLM10.9 Path traversal via an agent-controlled file path (Python tool)
+*Now shipped as `BAS-LLM10-012`.*
+
 **What it detects:** A tool's `path` argument (from LLM tool-call args) is
 joined with `os.path.join(BASE_DIR, path)` and opened, with no
 `os.path.realpath`/containment check against `BASE_DIR`, allowing
@@ -1181,6 +1226,11 @@ and `mcp-server-git`'s `git_init` tool accepted arbitrary paths
 **Source:** [Langflow CVE-2026-5027 write-up](https://thehackernews.com/2026/06/unpatched-langflow-flaw-cve-2026-5027.html)
 
 ### LLM10.11 Path-containment check uses string prefix instead of resolved path
+*The inline-open-call shape here is also covered by the shipped `BAS-LLM10-012`,
+whose description explicitly notes that a string-prefix check elsewhere in the
+function does not change the outcome; the general dataflow case (containment
+check and `open()` separated across statements) remains unshipped.*
+
 **What it detects:** A narrower, higher-precision variant of LLM10.9/10:
 a containment check exists (so a naive "is there any check" rule would
 pass it), but it compares a string prefix rather than a canonicalized/
@@ -1205,6 +1255,8 @@ harder to catch than "not fixed at all," which is exactly why it recurs.
 **Source:** [GHSA-j893-m93w-jwjw](https://github.com/advisories/GHSA-j893-m93w-jwjw)
 
 ### LLM10.12 Code-execution tool shells out via `subprocess`/`child_process` as its "sandbox"
+*Now shipped as `BAS-LLM10-009`.*
+
 **What it detects:** An LLM-facing "run code" or "execute command" tool
 passes model-generated code/commands to `subprocess.run(code, shell=True)`
 or Node `child_process.exec(cmd)`, using the parent shell as the entire
@@ -1400,8 +1452,15 @@ author or select pipeline templates.
 
 ## ZT1 Identity and Credentials
 
-Bastyn ships `BAS-ZT1-001`, `-002`, `-003` here today. The entries below
-add the MCP-specific OAuth/token-handling failures the spec itself now
+Bastyn ships `BAS-ZT1-001`, `-002`, `-003` here today, plus `BAS-ZT1-021`/
+`-022` (a provider API key literal, and any other credential-shaped
+literal, in a committed `.env` file). The last two are Rust-native, like
+the Dockerfile/Compose checks in `crate::infra` — the match logic is
+`credential::is_provider_key_literal`/`looks_like_credential_key`/
+`is_hardcoded_credential_value`, not an `ast-grep` pattern, so there is no
+YAML rule file for either; see `crates/bastyn-core/src/dotenv.rs`'s own
+module doc comment for the full rule table. The entries below add the
+MCP-specific OAuth/token-handling failures the spec itself now
 documents in detail, plus the "is this endpoint authenticated at all"
 question that current rules don't touch.
 
@@ -2205,11 +2264,16 @@ either a confidence threshold or the dataflow layer, not in "ship today."
 
 Of 100 distinct, sourced rules: **53 (53%) are structural**, reachable on
 Bastyn's current ast-grep engine with no architecture change. **34 (34%)
-are dataflow**. They need real source-to-sink provenance tracking, which
-the engine does not have today (its only approximation, matching a
-captured variable's *name* against a word list, is the exact mechanism
-measured to catch 0 of 119 realistic alternate namings). **13 (13%) are
-semantic**. They require judging intent, correctness, or runtime
+are dataflow**. They need real source-to-sink provenance tracking broader
+than what the engine has today: a Python-only, single-file flow graph that
+a handful of shipped rules ask instead of matching a name. Every other rule
+with a naming gate still approximates provenance the old way, matching a
+captured variable's *name* against a word list — the mechanism
+`crates/bastyn-core/tests/brittleness_gate.rs` measures across every row it
+tracks at 32.8% real-world survival (39 of 119), a figure that includes four
+rows that have since moved onto the dataflow graph and score 100%; the rows
+that still gate purely on a name survive at 2.4% (2 of 82). **13 (13%)
+are semantic**. They require judging intent, correctness, or runtime
 behavior from static text, and no engine investment closes that gap; they
 are listed to be honest about what "coverage" cannot mean, not as a
 future roadmap item.
